@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+innova-ai-investigation-runtime/.venv/
+innova-ai-investigation-runtime/output/
+innova-ai-investigation-runtime/resources/keys/*
+!innova-ai-investigation-runtime/resources/keys/.gitkeep
+innova-ai-investigation-runtime/.env
+innova-ai-investigation-runtime/vendor/sdk_archives/*.zip
+innova-ai-investigation-runtime/vendor/sdk_archives/*.tar.gz
+
+innova-live-view-runtime/.env

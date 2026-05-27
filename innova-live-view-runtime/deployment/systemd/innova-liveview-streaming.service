@@ -1,0 +1,16 @@
+[Unit]
+Description=Innova Live View Streaming Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/innova/live-streaming
+EnvironmentFile=/opt/innova/live-streaming/.env
+ExecStart=/opt/innova/live-streaming/.venv/bin/uvicorn app.server:app --host 0.0.0.0 --port 8600
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+{
+  "profiles": [
+    {
+      "name": "Glorieta Dahua",
+      "vendor": "Dahua",
+      "host": "170.55.166.214",
+      "sdk_port": 37777,
+      "rtsp_port": 8085,
+      "username": "sanket",
+      "password": "B00kk33p3r?",
+      "channel_hint": 12,
+      "notes": "Probado localmente con NetSDK Java Mac. Login SDK OK y query de grabaciones OK en canal 12."
+    }
+  ]
+}

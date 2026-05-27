@@ -1,0 +1,67 @@
+{
+  "default_profile": "Glorieta Gardens",
+  "profiles": [
+    {
+      "name": "Glorieta Gardens",
+      "vendor": "Hikvision",
+      "host": "170.55.166.214",
+      "http_port": 8087,
+      "sdk_port": 8000,
+      "username": "admin",
+      "password": "R4CapiinnovaR4!!",
+      "notes": "NVR probado con HCNetSDK e ISAPI."
+    },
+    {
+      "name": "Lakewood Richmond",
+      "vendor": "Hikvision",
+      "host": "innrichmond.ddns.net",
+      "http_port": 81,
+      "sdk_port": 8000,
+      "username": "admin",
+      "password": "Inn0vatech1!",
+      "notes": "NVR Richmond Hills / Lakewood. ISAPI OK, canales y status accesibles."
+    },
+    {
+      "name": "Valencia NVR1",
+      "vendor": "Hikvision",
+      "host": "innvalencia.ddns.net",
+      "http_port": 81,
+      "sdk_port": 8001,
+      "username": "admin",
+      "password": "Inn0vatech1!",
+      "notes": "Perfil Valencia 1. Inferido como 81 -> 8001. La UI web responde; ISAPI sigue devolviendo 401 con estas credenciales en esta validacion."
+    },
+    {
+      "name": "Valencia NVR2",
+      "vendor": "Hikvision",
+      "host": "innvalencia.ddns.net",
+      "http_port": 82,
+      "sdk_port": 8002,
+      "username": "admin",
+      "password": "Inn0vatech1!",
+      "notes": "ISAPI OK. deviceName=VW-NVR2, modelo OCB-8832MI-M4, firmware V4.61.410."
+    },
+    {
+      "name": "Valencia NVR3",
+      "vendor": "Hikvision",
+      "host": "innvalencia.ddns.net",
+      "http_port": 83,
+      "sdk_port": 8003,
+      "username": "admin",
+      "password": "Inn0vatech1!",
+      "notes": "ISAPI OK. deviceName=VW-NVR3, modelo OCB-8832MI-M4, firmware V4.61.410."
+    },
+    {
+      "name": "Glorieta Dahua",
+      "vendor": "Dahua",
+      "host": "170.55.166.214",
+      "http_port": 8085,
+      "sdk_port": 37777,
+      "rtsp_port": 8085,
+      "username": "sanket",
+      "password": "B00kk33p3r?",
+      "channel_hint": 12,
+      "notes": "NetSDK Java Mac probado localmente. Login SDK OK y query de grabaciones OK en canal 12."
+    }
+  ]
+}

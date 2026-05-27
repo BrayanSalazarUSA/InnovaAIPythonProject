@@ -1,0 +1,16 @@
+[Unit]
+Description=Innova AI Investigation Runtime
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/innova/investigation
+EnvironmentFile=/opt/innova/investigation/.env
+ExecStart=/opt/innova/investigation/.venv/bin/python -m innova_investigation
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "camera_id": "demo-camera-roboflow",
+  "camera_name": "Demo Camera With Custom Model",
+  "source": "rtsp://innovatech:C0ntr0l1!@170.55.166.214:1033/Streaming/Channels/1002",
+  "output_dir": "output/event_monitor/demo-camera-roboflow",
+  "yolo_model": "yolo11n.pt",
+  "sample_every_seconds": 1.0,
+  "max_runtime_seconds": 300,
+  "save_annotated_frames": true,
+  "rules": [
+    {
+      "name": "garbage_custom_model",
+      "type": "custom_model",
+      "model_path": "resources/event_monitor/models/garbage_best.pt",
+      "class_names": ["trash", "garbage", "garbage_bag"],
+      "min_confidence": 0.35,
+      "cooldown_seconds": 20
+    }
+  ]
+}
+

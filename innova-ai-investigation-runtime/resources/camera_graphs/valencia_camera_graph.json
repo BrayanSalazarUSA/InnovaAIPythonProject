@@ -1,0 +1,413 @@
+{
+  "site": {
+    "id": "valencia_way_apartments",
+    "name": "Valencia Way Apartments",
+    "address": "1214 Labelle St Jacksonville, FL 32205",
+    "generated_at": "2026-04-11",
+    "status": "seed_graph",
+    "notes": [
+      "Grafo inicial inferido a partir del plano de vigilancia, snapshots y metadata ISAPI de los NVR.",
+      "Las conexiones estan pensadas para seguimiento multicamara eficiente, no como verdad absoluta de residencia.",
+      "Las transiciones estan marcadas para priorizar busqueda en camaras vecinas antes de abrir todo el circuito."
+    ]
+  },
+  "source_materials": {
+    "map_pdf": "external/local source document",
+    "rendered_map_png": "external/local rendered image",
+    "nvr_profiles": "resources/nvr_profiles.local.json"
+  },
+  "camera_name_scheme": {
+    "building_camera_pattern": "B14_2 => edificio 14, camara 2",
+    "facility_pattern": "Nombres libres para areas comunes como Laundry 1 o Maintenance Shop"
+  },
+  "nvrs": [
+    {
+      "id": "valencia_nvr_1",
+      "name": "Valencia NVR1",
+      "host": "innvalencia.ddns.net",
+      "http_port": 81,
+      "sdk_port": 8001,
+      "state": "pending_validation",
+      "notes": "La UI web responde, pero ISAPI devolvio 401 con estas credenciales en la validacion actual."
+    },
+    {
+      "id": "valencia_nvr_2",
+      "name": "Valencia NVR2",
+      "host": "innvalencia.ddns.net",
+      "http_port": 82,
+      "sdk_port": 8002,
+      "state": "validated"
+    },
+    {
+      "id": "valencia_nvr_3",
+      "name": "Valencia NVR3",
+      "host": "innvalencia.ddns.net",
+      "http_port": 83,
+      "sdk_port": 8003,
+      "state": "validated"
+    }
+  ],
+  "building_graph": {
+    "1": ["2", "18", "19"],
+    "2": ["1", "3", "14", "19"],
+    "3": ["2", "4", "6"],
+    "4": ["3", "5", "6"],
+    "5": ["4", "8", "14"],
+    "6": ["3", "4", "7", "11"],
+    "8": ["5", "9", "14"],
+    "9": ["8", "10", "23"],
+    "10": ["9", "11"],
+    "11": ["6", "10", "24"],
+    "12": ["16", "17"],
+    "13": ["14", "15", "22"],
+    "14": ["2", "5", "8", "13", "23"],
+    "15": ["13", "16", "19"],
+    "16": ["12", "15", "17"],
+    "17": ["16", "18"],
+    "18": ["1", "17"],
+    "19": ["1", "2", "15"],
+    "20": ["21", "22"],
+    "21": ["20", "22", "32"],
+    "22": ["13", "20", "21", "23"],
+    "23": ["9", "14", "22", "24"],
+    "24": ["11", "23"],
+    "32": ["21"]
+  },
+  "facility_graph": {
+    "Maintenance Shop": ["Outdoor Elec Room", "Laundry 1", "Laundry 2"],
+    "Laundry 1": ["Laundry 2", "Indoor Elec room", "Outdoor Elec Room"],
+    "Laundry 2": ["Laundry 1", "Indoor Elec room", "Outdoor Elec Room"],
+    "Indoor Elec room": ["Laundry 1", "Laundry 2", "Outdoor Elec Room"],
+    "Outdoor Elec Room": ["Maintenance Shop", "Laundry 1", "Laundry 2", "Indoor Elec room", "B18_1", "B18_2"]
+  },
+  "camera_inventory": [
+    {"camera_id": "B32_3", "building_id": "32", "camera_index": 3, "nvr_id": "valencia_nvr_2", "logical_channel": 1, "ip": "10.192.45.43", "online": true},
+    {"camera_id": "B24_1", "building_id": "24", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 2, "ip": "10.192.45.44", "online": true},
+    {"camera_id": "B23_1", "building_id": "23", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 3, "ip": "10.192.45.45", "online": true},
+    {"camera_id": "B20_1", "building_id": "20", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 4, "ip": "10.192.45.46", "online": true},
+    {"camera_id": "B21_1", "building_id": "21", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 5, "ip": "10.192.45.47", "online": true},
+    {"camera_id": "B21_2", "building_id": "21", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 6, "ip": "10.192.45.48", "online": true},
+    {"camera_id": "B22_1", "building_id": "22", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 7, "ip": "10.192.45.49", "online": true},
+    {"camera_id": "B9_1", "building_id": "9", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 8, "ip": "10.192.45.50", "online": true},
+    {"camera_id": "B9_2", "building_id": "9", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 9, "ip": "10.192.45.51", "online": true},
+    {"camera_id": "B9_3", "building_id": "9", "camera_index": 3, "nvr_id": "valencia_nvr_2", "logical_channel": 10, "ip": "10.192.45.52", "online": true},
+    {"camera_id": "B9_4", "building_id": "9", "camera_index": 4, "nvr_id": "valencia_nvr_2", "logical_channel": 11, "ip": "10.192.45.53", "online": true},
+    {"camera_id": "B10_1", "building_id": "10", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 12, "ip": "10.192.45.54", "online": true},
+    {"camera_id": "B11_1", "building_id": "11", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 13, "ip": "10.192.45.55", "online": true},
+    {"camera_id": "B11_2", "building_id": "11", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 14, "ip": "10.192.45.56", "online": true},
+    {"camera_id": "B12_1", "building_id": "12", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 15, "ip": "10.192.45.57", "online": true},
+    {"camera_id": "B12_2", "building_id": "12", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 16, "ip": "10.192.45.58", "online": true},
+    {"camera_id": "B13_1", "building_id": "13", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 17, "ip": "10.192.45.59", "online": true},
+    {"camera_id": "B14_1", "building_id": "14", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 18, "ip": "10.192.45.60", "online": true},
+    {"camera_id": "B14_2", "building_id": "14", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 19, "ip": "10.192.45.61", "online": true},
+    {"camera_id": "B5_1", "building_id": "5", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 20, "ip": "10.192.45.62", "online": true},
+    {"camera_id": "B5_2", "building_id": "5", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 21, "ip": "10.192.45.63", "online": true},
+    {"camera_id": "B8_1", "building_id": "8", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 22, "ip": "10.192.45.64", "online": true},
+    {"camera_id": "B8_2", "building_id": "8", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 23, "ip": "10.192.45.65", "online": true},
+    {"camera_id": "B6_1", "building_id": "6", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 24, "ip": "10.192.45.66", "online": true},
+    {"camera_id": "B6_2", "building_id": "6", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 25, "ip": "10.192.45.67", "online": true},
+    {"camera_id": "B4_1", "building_id": "4", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 26, "ip": "10.192.45.68", "online": true},
+    {"camera_id": "B4_2", "building_id": "4", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 27, "ip": "10.192.45.69", "online": true},
+    {"camera_id": "B3_1", "building_id": "3", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 28, "ip": "10.192.45.70", "online": true},
+    {"camera_id": "B2_1", "building_id": "2", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 29, "ip": "10.192.45.71", "online": true},
+    {"camera_id": "B2_2", "building_id": "2", "camera_index": 2, "nvr_id": "valencia_nvr_2", "logical_channel": 30, "ip": "10.192.45.72", "online": true},
+    {"camera_id": "B2_3", "building_id": "2", "camera_index": 3, "nvr_id": "valencia_nvr_2", "logical_channel": 31, "ip": "10.192.45.75", "online": true},
+    {"camera_id": "B1_1", "building_id": "1", "camera_index": 1, "nvr_id": "valencia_nvr_2", "logical_channel": 32, "ip": "10.192.45.73", "online": true},
+
+    {"camera_id": "B1_2", "building_id": "1", "camera_index": 2, "nvr_id": "valencia_nvr_3", "logical_channel": 1, "ip": "10.192.45.74", "online": true},
+    {"camera_id": "B1_3", "building_id": "1", "camera_index": 3, "nvr_id": "valencia_nvr_3", "logical_channel": 2, "ip": "10.192.45.84", "online": true},
+    {"camera_id": "B15_1", "building_id": "15", "camera_index": 1, "nvr_id": "valencia_nvr_3", "logical_channel": 3, "ip": "10.192.45.76", "online": true},
+    {"camera_id": "B17_1", "building_id": "17", "camera_index": 1, "nvr_id": "valencia_nvr_3", "logical_channel": 4, "ip": "10.192.45.77", "online": true},
+    {"camera_id": "B17_3", "building_id": "17", "camera_index": 3, "nvr_id": "valencia_nvr_3", "logical_channel": 5, "ip": "10.192.45.79", "online": false},
+    {"camera_id": "B17_2", "building_id": "17", "camera_index": 2, "nvr_id": "valencia_nvr_3", "logical_channel": 6, "ip": "10.192.45.78", "online": true},
+    {"camera_id": "B18_1", "building_id": "18", "camera_index": 1, "nvr_id": "valencia_nvr_3", "logical_channel": 7, "ip": "10.192.45.80", "online": true},
+    {"camera_id": "B18_2", "building_id": "18", "camera_index": 2, "nvr_id": "valencia_nvr_3", "logical_channel": 8, "ip": "10.192.45.81", "online": true},
+    {"camera_id": "B19_1", "building_id": "19", "camera_index": 1, "nvr_id": "valencia_nvr_3", "logical_channel": 9, "ip": "10.192.45.82", "online": true},
+    {"camera_id": "B19_2", "building_id": "19", "camera_index": 2, "nvr_id": "valencia_nvr_3", "logical_channel": 10, "ip": "10.192.45.83", "online": true},
+    {"camera_id": "Maintenance Shop", "building_id": null, "camera_index": null, "nvr_id": "valencia_nvr_3", "logical_channel": 11, "ip": "10.192.45.85", "online": true},
+    {"camera_id": "Laundry 1", "building_id": null, "camera_index": null, "nvr_id": "valencia_nvr_3", "logical_channel": 12, "ip": "10.192.45.86", "online": true},
+    {"camera_id": "Laundry 2", "building_id": null, "camera_index": null, "nvr_id": "valencia_nvr_3", "logical_channel": 13, "ip": "10.192.45.87", "online": true},
+    {"camera_id": "Indoor Elec room", "building_id": null, "camera_index": null, "nvr_id": "valencia_nvr_3", "logical_channel": 14, "ip": "10.192.45.88", "online": true},
+    {"camera_id": "Outdoor Elec Room", "building_id": null, "camera_index": null, "nvr_id": "valencia_nvr_3", "logical_channel": 15, "ip": "10.192.45.89", "online": true}
+  ],
+  "camera_handoff_rules": {
+    "B24_1": [
+      {"camera_id": "B23_1", "confidence": "high", "reason": "Edificios contiguos en el corredor norte-centro"},
+      {"camera_id": "B11_1", "confidence": "medium", "reason": "Conexion por el tramo superior derecho del plano"}
+    ],
+    "B23_1": [
+      {"camera_id": "B24_1", "confidence": "high", "reason": "Edificio vecino inmediato"},
+      {"camera_id": "B22_1", "confidence": "high", "reason": "Corredor vertical central"},
+      {"camera_id": "B14_1", "confidence": "medium", "reason": "Cruce hacia el patio central"},
+      {"camera_id": "B9_1", "confidence": "medium", "reason": "Transicion posible hacia bloque 9"}
+    ],
+    "B22_1": [
+      {"camera_id": "B21_1", "confidence": "high", "reason": "Bloques contiguos"},
+      {"camera_id": "B20_1", "confidence": "high", "reason": "Corredor oeste inmediato"},
+      {"camera_id": "B13_1", "confidence": "high", "reason": "Bajada directa hacia zona central-sur"},
+      {"camera_id": "B23_1", "confidence": "high", "reason": "Subida directa al bloque 23"}
+    ],
+    "B21_1": [
+      {"camera_id": "B21_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B20_1", "confidence": "high", "reason": "Edificio vecino"},
+      {"camera_id": "B22_1", "confidence": "high", "reason": "Edificio vecino"},
+      {"camera_id": "B32_3", "confidence": "medium", "reason": "Conexion al ala oeste del predio"}
+    ],
+    "B21_2": [
+      {"camera_id": "B21_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B20_1", "confidence": "medium", "reason": "Vecino inmediato"},
+      {"camera_id": "B22_1", "confidence": "medium", "reason": "Vecino inmediato"}
+    ],
+    "B20_1": [
+      {"camera_id": "B21_1", "confidence": "high", "reason": "Edificio contiguo"},
+      {"camera_id": "B22_1", "confidence": "medium", "reason": "Cruce al corredor central"}
+    ],
+    "B14_1": [
+      {"camera_id": "B14_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B13_1", "confidence": "high", "reason": "Corredor sur inmediato"},
+      {"camera_id": "B5_1", "confidence": "medium", "reason": "Transicion este hacia bloque 5"},
+      {"camera_id": "B8_1", "confidence": "medium", "reason": "Cruce norte-este"},
+      {"camera_id": "B23_1", "confidence": "medium", "reason": "Cruce norte-centro"},
+      {"camera_id": "B2_1", "confidence": "low", "reason": "Conexion larga por eje este"}
+    ],
+    "B14_2": [
+      {"camera_id": "B14_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B13_1", "confidence": "medium", "reason": "Salida natural al sur"},
+      {"camera_id": "B5_2", "confidence": "medium", "reason": "Salida al este"},
+      {"camera_id": "B8_2", "confidence": "medium", "reason": "Salida al noreste"}
+    ],
+    "B13_1": [
+      {"camera_id": "B14_1", "confidence": "high", "reason": "Edificio vecino"},
+      {"camera_id": "B15_1", "confidence": "high", "reason": "Continuacion sur por eje central"},
+      {"camera_id": "B22_1", "confidence": "high", "reason": "Subida directa al bloque 22"}
+    ],
+    "B15_1": [
+      {"camera_id": "B13_1", "confidence": "high", "reason": "Regreso al eje central"},
+      {"camera_id": "B16", "confidence": "medium", "reason": "El plano sugiere salida hacia edificio 16, aun sin camara nombrada"},
+      {"camera_id": "B19_1", "confidence": "medium", "reason": "Cruce este-sur"}
+    ],
+    "B5_1": [
+      {"camera_id": "B5_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B4_1", "confidence": "high", "reason": "Vecino inmediato al sur"},
+      {"camera_id": "B8_1", "confidence": "medium", "reason": "Conexion norte"},
+      {"camera_id": "B14_1", "confidence": "medium", "reason": "Cruce oeste"}
+    ],
+    "B5_2": [
+      {"camera_id": "B5_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B4_2", "confidence": "high", "reason": "Vecino inmediato"},
+      {"camera_id": "B8_2", "confidence": "medium", "reason": "Salida al norte"},
+      {"camera_id": "B14_2", "confidence": "medium", "reason": "Salida al oeste"}
+    ],
+    "B8_1": [
+      {"camera_id": "B8_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_1", "confidence": "high", "reason": "Subida al bloque 9"},
+      {"camera_id": "B5_1", "confidence": "medium", "reason": "Bajada al bloque 5"},
+      {"camera_id": "B14_1", "confidence": "medium", "reason": "Cruce al patio central"}
+    ],
+    "B8_2": [
+      {"camera_id": "B8_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_3", "confidence": "medium", "reason": "Ruta al bloque 9"},
+      {"camera_id": "B5_2", "confidence": "medium", "reason": "Ruta al bloque 5"},
+      {"camera_id": "B14_2", "confidence": "medium", "reason": "Cruce al patio central"}
+    ],
+    "B9_1": [
+      {"camera_id": "B9_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B10_1", "confidence": "high", "reason": "Bloque contiguo al norte"},
+      {"camera_id": "B23_1", "confidence": "medium", "reason": "Cruce al corredor central"},
+      {"camera_id": "B8_1", "confidence": "medium", "reason": "Bajada hacia bloque 8"}
+    ],
+    "B9_2": [
+      {"camera_id": "B9_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_4", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B10_1", "confidence": "medium", "reason": "Salida al norte"}
+    ],
+    "B9_3": [
+      {"camera_id": "B9_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_4", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B10_1", "confidence": "medium", "reason": "Salida al norte"},
+      {"camera_id": "B8_2", "confidence": "medium", "reason": "Salida al sur"}
+    ],
+    "B9_4": [
+      {"camera_id": "B9_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B9_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B10_1", "confidence": "medium", "reason": "Salida al norte"}
+    ],
+    "B10_1": [
+      {"camera_id": "B9_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B11_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B11_2", "confidence": "medium", "reason": "Segunda vista del mismo sector"}
+    ],
+    "B11_1": [
+      {"camera_id": "B11_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B10_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B6_1", "confidence": "medium", "reason": "Bajada por el corredor este"},
+      {"camera_id": "B24_1", "confidence": "medium", "reason": "Regreso hacia el norte-centro"}
+    ],
+    "B11_2": [
+      {"camera_id": "B11_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B6_2", "confidence": "medium", "reason": "Bajada al bloque 6"},
+      {"camera_id": "B10_1", "confidence": "medium", "reason": "Regreso al norte"}
+    ],
+    "B6_1": [
+      {"camera_id": "B6_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B4_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B3_1", "confidence": "medium", "reason": "Ruta al sur"},
+      {"camera_id": "B11_1", "confidence": "medium", "reason": "Ruta al norte"}
+    ],
+    "B6_2": [
+      {"camera_id": "B6_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B4_2", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B3_1", "confidence": "medium", "reason": "Ruta al sur"},
+      {"camera_id": "B11_2", "confidence": "medium", "reason": "Ruta al norte"}
+    ],
+    "B4_1": [
+      {"camera_id": "B4_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B5_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B3_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B6_1", "confidence": "medium", "reason": "Ruta este"}
+    ],
+    "B4_2": [
+      {"camera_id": "B4_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B5_2", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B3_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B6_2", "confidence": "medium", "reason": "Ruta este"}
+    ],
+    "B3_1": [
+      {"camera_id": "B2_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B4_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B4_2", "confidence": "high", "reason": "Segunda vista vecina"},
+      {"camera_id": "B6_1", "confidence": "medium", "reason": "Ruta al norte"}
+    ],
+    "B2_1": [
+      {"camera_id": "B2_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B3_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B14_1", "confidence": "low", "reason": "Cruce largo hacia el patio central"},
+      {"camera_id": "B19_1", "confidence": "medium", "reason": "Ruta este-sur"}
+    ],
+    "B2_2": [
+      {"camera_id": "B2_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_2", "confidence": "medium", "reason": "Bloque contiguo"},
+      {"camera_id": "B19_1", "confidence": "medium", "reason": "Ruta este-sur"}
+    ],
+    "B2_3": [
+      {"camera_id": "B2_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_3", "confidence": "medium", "reason": "Bloque contiguo"},
+      {"camera_id": "B19_2", "confidence": "medium", "reason": "Ruta este-sur"}
+    ],
+    "B1_1": [
+      {"camera_id": "B1_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B18_1", "confidence": "medium", "reason": "Ruta sur-este"},
+      {"camera_id": "B19_1", "confidence": "medium", "reason": "Ruta norte-este"}
+    ],
+    "B1_2": [
+      {"camera_id": "B1_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_3", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_2", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B18_2", "confidence": "medium", "reason": "Ruta sur-este"}
+    ],
+    "B1_3": [
+      {"camera_id": "B1_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B2_3", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B19_2", "confidence": "medium", "reason": "Ruta norte-este"}
+    ],
+    "B17_1": [
+      {"camera_id": "B17_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B17_3", "confidence": "high", "reason": "Mismo edificio, actualmente offline"},
+      {"camera_id": "B18_1", "confidence": "high", "reason": "Bloque contiguo"},
+      {"camera_id": "B16", "confidence": "medium", "reason": "Conexion sugerida por el plano hacia el oeste"}
+    ],
+    "B17_2": [
+      {"camera_id": "B17_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B17_3", "confidence": "high", "reason": "Mismo edificio, actualmente offline"},
+      {"camera_id": "B18_2", "confidence": "high", "reason": "Bloque contiguo"}
+    ],
+    "B17_3": [
+      {"camera_id": "B17_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B17_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B18_1", "confidence": "medium", "reason": "Bloque contiguo"},
+      {"camera_id": "B18_2", "confidence": "medium", "reason": "Bloque contiguo"}
+    ],
+    "B18_1": [
+      {"camera_id": "B18_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B17_1", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B1_1", "confidence": "medium", "reason": "Ruta al edificio 1"},
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Zona de servicios cercana"}
+    ],
+    "B18_2": [
+      {"camera_id": "B18_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B17_2", "confidence": "high", "reason": "Bloque vecino"},
+      {"camera_id": "B1_2", "confidence": "medium", "reason": "Ruta al edificio 1"},
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Zona de servicios cercana"}
+    ],
+    "B19_1": [
+      {"camera_id": "B19_2", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_1", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B2_1", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B15_1", "confidence": "medium", "reason": "Ruta oeste por el eje sur"}
+    ],
+    "B19_2": [
+      {"camera_id": "B19_1", "confidence": "high", "reason": "Mismo edificio"},
+      {"camera_id": "B1_3", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B2_3", "confidence": "medium", "reason": "Bloque vecino"},
+      {"camera_id": "B15_1", "confidence": "medium", "reason": "Ruta oeste"}
+    ],
+    "B15_1": [
+      {"camera_id": "B13_1", "confidence": "high", "reason": "Continuacion por el eje central"},
+      {"camera_id": "B19_1", "confidence": "medium", "reason": "Salida hacia el este"},
+      {"camera_id": "B19_2", "confidence": "medium", "reason": "Salida hacia el este"}
+    ],
+    "B32_3": [
+      {"camera_id": "B21_1", "confidence": "medium", "reason": "Conexion por el corredor oeste-centro"},
+      {"camera_id": "B21_2", "confidence": "medium", "reason": "Conexion por el corredor oeste-centro"}
+    ],
+    "Maintenance Shop": [
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Zona de servicios relacionada"},
+      {"camera_id": "Laundry 1", "confidence": "low", "reason": "Posible ruta por servicios"}
+    ],
+    "Laundry 1": [
+      {"camera_id": "Laundry 2", "confidence": "high", "reason": "Mismo cluster de servicios"},
+      {"camera_id": "Indoor Elec room", "confidence": "medium", "reason": "Servicios interiores"},
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Servicios exteriores"}
+    ],
+    "Laundry 2": [
+      {"camera_id": "Laundry 1", "confidence": "high", "reason": "Mismo cluster de servicios"},
+      {"camera_id": "Indoor Elec room", "confidence": "medium", "reason": "Servicios interiores"},
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Servicios exteriores"}
+    ],
+    "Indoor Elec room": [
+      {"camera_id": "Laundry 1", "confidence": "medium", "reason": "Cluster interior"},
+      {"camera_id": "Laundry 2", "confidence": "medium", "reason": "Cluster interior"},
+      {"camera_id": "Outdoor Elec Room", "confidence": "medium", "reason": "Transicion interior-exterior"}
+    ],
+    "Outdoor Elec Room": [
+      {"camera_id": "Indoor Elec room", "confidence": "medium", "reason": "Transicion de servicios"},
+      {"camera_id": "Maintenance Shop", "confidence": "medium", "reason": "Area de servicios"},
+      {"camera_id": "B18_1", "confidence": "medium", "reason": "Edificio cercano"},
+      {"camera_id": "B18_2", "confidence": "medium", "reason": "Edificio cercano"}
+    ]
+  },
+  "recommended_tracking_order_rules": [
+    "Buscar primero en camaras del mismo edificio que la camara origen.",
+    "Luego abrir camaras de edificios vecinos segun building_graph.",
+    "Priorizar transiciones con confidence=high antes de medium y low.",
+    "Usar una ventana temporal corta de 5 a 25 segundos entre camaras vecinas, segun distancia visible en el plano.",
+    "Si la persona desaparece por un borde del frame, combinar direccion de salida con camera_handoff_rules para reducir candidatas.",
+    "Si una camara esta offline, saltar a la siguiente candidata del mismo edificio o del edificio adyacente."
+  ],
+  "validation_backlog": [
+    "Confirmar manualmente si B24_1 conecta primero con B11_1 o con otro nodo del corredor norte.",
+    "Validar si B15_1 tiene vista suficiente hacia B16 o si la transicion debe hacerse directo a B17.",
+    "Confirmar el rol real de B17_3 cuando vuelva a estar online.",
+    "Refinar rutas entre edificios 1, 2, 18 y 19 usando ejemplos reales de trayectorias.",
+    "Decidir si las areas de Laundry y Electrical Room deben entrar al flujo residencial o quedar como zonas especiales."
+  ]
+}

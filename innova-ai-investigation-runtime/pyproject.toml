@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "innova-ai-investigation-runtime"
+version = "0.1.0"
+description = "Unified Python runtime for CCTV AI investigation workflows over Hikvision and Dahua NVRs."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "numpy>=2.0,<3",
+  "opencv-python-headless>=4.10,<5",
+  "pydantic>=2.8,<3",
+  "python-multipart>=0.0.9,<1",
+  "requests>=2.32,<3",
+  "supervision>=0.28,<0.30",
+  "ultralytics>=8.3,<9",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.scripts]
+innova-investigation-api = "innova_investigation.__main__:main"
+innova-hikvision-health = "innova_investigation.tools.hikvision_health_check:main"
+innova-dahua-health = "innova_investigation.tools.dahua_health_check:main"
+innova-event-monitor = "innova_investigation.event_monitor.cli:main"
+innova-event-monitor-api = "innova_investigation.event_monitor.api:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

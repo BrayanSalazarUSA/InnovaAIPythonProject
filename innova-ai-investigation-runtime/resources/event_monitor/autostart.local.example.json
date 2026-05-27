@@ -1,0 +1,78 @@
+{
+  "camera_id": "front-lpr",
+  "camera_name": "Front LPR",
+  "source": "rtsp://USER:PASSWORD@HOST:554/Streaming/Channels/101",
+  "output_dir": "output/event_monitor/front-lpr",
+  "yolo_model": "yolo11n.pt",
+  "sample_every_seconds": 0.25,
+  "max_runtime_seconds": null,
+  "enable_tracking": true,
+  "save_once_per_track": true,
+  "tracker_type": "botsort.yaml",
+  "tracker_confidence": 0.1,
+  "enable_reid_merge": true,
+  "reid_merge_seconds": 180,
+  "reid_similarity_threshold": 0.86,
+  "save_annotated_frames": true,
+  "rules": [
+    {
+      "name": "person",
+      "type": "class",
+      "class_names": ["person"],
+      "min_confidence": 0.7,
+      "cooldown_seconds": 6
+    },
+    {
+      "name": "vehicle",
+      "type": "class",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "cooldown_seconds": 6
+    },
+    {
+      "name": "white_vehicle",
+      "type": "vehicle_color",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "color": "white",
+      "color_threshold": 0.32,
+      "cooldown_seconds": 10
+    },
+    {
+      "name": "gray_vehicle",
+      "type": "vehicle_color",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "color": "gray",
+      "color_threshold": 0.32,
+      "cooldown_seconds": 10
+    },
+    {
+      "name": "black_vehicle",
+      "type": "vehicle_color",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "color": "black",
+      "color_threshold": 0.32,
+      "cooldown_seconds": 10
+    },
+    {
+      "name": "red_vehicle",
+      "type": "vehicle_color",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "color": "red",
+      "color_threshold": 0.32,
+      "cooldown_seconds": 10
+    },
+    {
+      "name": "blue_vehicle",
+      "type": "vehicle_color",
+      "class_names": ["car", "truck", "bus", "motorcycle", "bicycle"],
+      "min_confidence": 0.7,
+      "color": "blue",
+      "color_threshold": 0.32,
+      "cooldown_seconds": 10
+    }
+  ]
+}
