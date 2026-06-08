@@ -9,6 +9,24 @@ SRC_DIR = PACKAGE_DIR.parent
 PROJECT_ROOT = SRC_DIR.parent
 RESOURCES_DIR = PROJECT_ROOT / "resources"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(PROJECT_ROOT / ".env")
+
 OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 DOCS_DIR = PROJECT_ROOT / "docs"
 VENDOR_DIR = PROJECT_ROOT / "vendor"
@@ -95,6 +113,7 @@ PERSON_VISIBLE_MATCH_BONUS = 0.05
 EARLY_MATCH_TIME_PENALTY_PER_SECOND = 0.002
 
 BACKEND_API_BASE_URL = os.getenv("INNOVA_BACKEND_API_URL", "http://127.0.0.1:8080/api").rstrip("/")
+PUBLIC_API_BASE_URL = os.getenv("INNOVA_PUBLIC_API_BASE_URL", "").strip().rstrip("/")
 NVR_PROFILES_PATH = Path(os.getenv("INNOVA_NVR_PROFILES_PATH", str(RESOURCES_DIR / "nvr_profiles.local.json")))
 SSH_KEY_PATH = Path(os.getenv("INNOVA_SSH_KEY_PATH", str(RESOURCES_DIR / "keys" / "elastic-beanstalk.pem")))
 REMOTE_BRIDGE_HOST = os.getenv("INNOVA_REMOTE_BRIDGE_HOST", "127.0.0.1")

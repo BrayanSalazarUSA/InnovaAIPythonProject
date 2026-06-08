@@ -11,9 +11,11 @@ fi
 
 source .venv/bin/activate
 
-if [[ -f .env ]]; then
+ENV_FILE="${INNOVA_ENV_FILE:-.env}"
+
+if [[ -f "$ENV_FILE" ]]; then
   set -a
-  source .env
+  source "$ENV_FILE"
   set +a
 fi
 

@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Innova Investigation API",
+      "type": "python",
+      "request": "launch",
+      "module": "innova_investigation",
+      "cwd": "${workspaceFolder}/innova-ai-investigation-runtime",
+      "python": "${workspaceFolder}/innova-ai-investigation-runtime/.venv/bin/python",
+      "envFile": "${workspaceFolder}/innova-ai-investigation-runtime/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

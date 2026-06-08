@@ -238,6 +238,39 @@ def _dark_roi_metrics(roi_image: Any, baseline_roi: Any | None = None) -> dict[s
     }
 
 
+def _prefer_native_clip_variant(video_path: Path) -> Path:
+    """Prefer the native clip when a browser-only sibling exists.
+
+    The UI can still request/play browser-friendly artifacts, but the analysis
+    pipeline should avoid re-cutting from a previously browser-converted file
+    when the original clip is available next to it.
+    """
+
+    if video_path.suffix.lower() != ".mp4":
+        return video_path
+
+    stem = video_path.stem
+    for marker in ("_browser_compatible", "_browser"):
+        if marker in stem:
+            native_stem = stem.replace(marker, "", 1)
+            native_candidate = video_path.with_name(f"{native_stem}{video_path.suffix}")
+            if native_candidate.exists():
+                return native_candidate
+    return video_path
+
+
+def ensure_analysis_clip(video_path: Path, *, output_dir: Path) -> Path:
+    """Return a clip OpenCV can scan without forcing browser transcoding."""
+
+    preferred_source = _prefer_native_clip_variant(video_path)
+    capture = cv2.VideoCapture(str(preferred_source))
+    is_openable = capture.isOpened()
+    capture.release()
+    if is_openable:
+        return preferred_source
+    return ensure_openable_clip(preferred_source, output_dir=output_dir)
+
+
 def ensure_openable_clip(video_path: Path, *, output_dir: Path) -> Path:
     def ffmpeg_path() -> Path | None:
         candidate = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
@@ -287,10 +320,14 @@ def ensure_openable_clip(video_path: Path, *, output_dir: Path) -> Path:
             "-y",
             "-i",
             str(source),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2:in_range=pc:out_range=tv,format=yuv420p",
             "-c:v",
             "libx264",
             "-pix_fmt",
             "yuv420p",
+            "-color_range",
+            "tv",
             "-movflags",
             "+faststart",
             "-an",
@@ -301,15 +338,17 @@ def ensure_openable_clip(video_path: Path, *, output_dir: Path) -> Path:
             raise RuntimeError(completed.stderr.strip() or "No se pudo convertir el clip a MP4.")
         return converted
 
-    capture = cv2.VideoCapture(str(video_path))
+    preferred_source = _prefer_native_clip_variant(video_path)
+
+    capture = cv2.VideoCapture(str(preferred_source))
     is_openable = capture.isOpened()
     capture.release()
 
-    if is_openable and is_browser_mp4(video_path):
-        return video_path
+    if is_openable and is_browser_mp4(preferred_source):
+        return preferred_source
 
-    if is_openable or video_path.suffix.lower() != ".mp4":
-        converted = convert_to_browser_mp4(video_path)
+    if is_openable or preferred_source.suffix.lower() != ".mp4":
+        converted = convert_to_browser_mp4(preferred_source)
         check = cv2.VideoCapture(str(converted))
         ok = check.isOpened()
         check.release()
@@ -320,10 +359,10 @@ def ensure_openable_clip(video_path: Path, *, output_dir: Path) -> Path:
     ffmpeg_bin = ffmpeg_path()
     if ffmpeg_bin is None:
         if is_openable:
-            return video_path
+            return preferred_source
         raise FileNotFoundError("ffmpeg no está disponible para convertir el clip.")
 
-    converted = convert_to_browser_mp4(video_path)
+    converted = convert_to_browser_mp4(preferred_source)
     check = cv2.VideoCapture(str(converted))
     ok = check.isOpened()
     check.release()
@@ -354,6 +393,7 @@ def extract_video_segment(
         return is_openable and total_frames > 0
 
     output_video.parent.mkdir(parents=True, exist_ok=True)
+    analysis_source = _prefer_native_clip_variant(source_video)
 
     ffmpeg_bin = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
     if Path(ffmpeg_bin).exists():
@@ -365,7 +405,7 @@ def extract_video_segment(
             "-to",
             f"{end_seconds:.3f}",
             "-i",
-            str(source_video),
+            str(analysis_source),
             "-c:v",
             "libx264",
             "-pix_fmt",
@@ -384,9 +424,9 @@ def extract_video_segment(
             except Exception:
                 pass
 
-    capture = cv2.VideoCapture(str(source_video))
+    capture = cv2.VideoCapture(str(analysis_source))
     if not capture.isOpened():
-        raise RuntimeError(f"No se pudo abrir el clip base: {source_video}")
+        raise RuntimeError(f"No se pudo abrir el clip base: {analysis_source}")
     fps = capture.get(cv2.CAP_PROP_FPS) or 15.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -404,7 +444,7 @@ def extract_video_segment(
     writer.release()
     capture.release()
     if not _is_valid_segment(output_video):
-        raise RuntimeError(f"No se pudo extraer un segmento de video válido desde {source_video}.")
+        raise RuntimeError(f"No se pudo extraer un segmento de video válido desde {analysis_source}.")
     return ensure_openable_clip(output_video, output_dir=output_video.parent)
 
 
@@ -598,7 +638,7 @@ def probe_static_object_clip(
     searcher = SimilaritySearcher()
     query_signature = searcher.build_query_signature(query_image)
     previous_threshold = runtime_config.SIMILARITY_THRESHOLD
-    effective_similarity_threshold = max(0.18, float(similarity_threshold) - (0.30 if roi else 0.0))
+    effective_similarity_threshold = max(0.22, float(similarity_threshold) - (0.18 if roi else 0.0))
     runtime_config.SIMILARITY_THRESHOLD = float(effective_similarity_threshold)
     baseline_roi_image = cv2.imread(str(baseline_roi_path)) if baseline_roi_path else None
     baseline_dark_object_score = _dark_object_score(baseline_roi_image) if baseline_roi_image is not None else None
@@ -898,9 +938,9 @@ def probe_static_object_clip(
         enough_dark_area_gain = best_dark_area_delta >= 0.035 or best_dark_component_delta >= 0.018
         enough_persistence = dark_persistence >= 0.50 or len(persistent_dark_samples) >= 2
         enough_visual_persistence = persistent_visual_frames >= 2 and persistent_visual_ratio >= 0.34
-        visual_support_threshold = max(0.18, min(0.35, float(similarity_threshold) - 0.30))
+        visual_support_threshold = max(0.22, min(0.40, float(similarity_threshold) - 0.20))
         visual_support = best_similarity_score >= visual_support_threshold
-        moderate_visual_match = best_similarity_score >= max(0.24, float(similarity_threshold) - 0.18)
+        moderate_visual_match = best_similarity_score >= max(0.30, float(similarity_threshold) - 0.14)
         structural_dark_mass = bool(
             large_dark_mass
             and (
@@ -912,7 +952,7 @@ def probe_static_object_clip(
         )
         specific_change_support = bool(
             require_change
-            and visual_support
+            and moderate_visual_match
             and (
                 (
                     structural_dark_mass
@@ -967,68 +1007,92 @@ def probe_static_object_clip(
                 or similarity_delta >= 0.04
             )
         )
-        present = bool(specific_change_support or specific_probe_support or visual_recovery_support)
-        if present and structural_dark_mass:
-            decision = "present_by_specific_similarity_gain_despite_structural_dark"
-            reason = (
-                "La masa oscura tiene rasgos estructurales, pero la similitud contra la referencia subió "
-                "lo suficiente frente al baseline para confirmarla."
-            )
-        elif present and visual_recovery_support and not enough_dark_gain:
-            decision = "present_by_persistent_visual_support"
-            reason = (
-                "La ROI mostró coincidencia visual persistente del objeto a lo largo del microclip "
-                "y suficiente cambio frente al baseline para confirmarlo aunque la masa oscura no fuera dominante."
-            )
-        elif present and require_change and enough_change and enough_dark_gain and enough_dark_area_gain:
-            decision = "present_by_roi_dark_specific_change"
-            reason = (
-                "La ROI tuvo cambio temporal específico, aumento de masa oscura frente al baseline "
-                "y soporte mínimo del matcher visual."
-            )
-        elif present and require_change and enough_similarity and enough_similarity_gain and not enough_change:
-            decision = "present_by_similarity_gain"
-            reason = (
-                "La ROI no tuvo un cambio global alto, pero la similitud contra la referencia subió claramente "
-                "frente al baseline inicial."
-            )
-        elif present:
-            decision = "present_by_temporal_change"
-            reason = "La ROI cambió respecto a la referencia temporal y la similitud visual apoyó la decisión."
-        elif visual_manual_candidate:
-            decision = "candidate_persistent_visual_manual_review"
-            reason = (
-                "La ROI mostró coincidencia visual persistente del objeto, pero todavía no alcanzó señal temporal "
-                "suficiente para confirmarlo automáticamente."
-            )
-        elif dark_manual_candidate:
-            decision = "candidate_dark_structural_mass_manual_review"
-            reason = (
-                "La ROI contiene una masa oscura persistente, pero es grande/estructural o pegada a bordes "
-                "y no tiene suficiente cambio/similitud específica para confirmarla como objeto abandonado."
-            )
-        elif not visual_support:
-            decision = "rejected_without_visual_support"
-            reason = "No hubo suficiente masa oscura persistente en la ROI ni soporte visual mínimo del matcher."
-        elif enough_similarity and not enough_similarity_gain and require_change:
-            decision = "rejected_similarity_without_baseline_gain"
-            reason = "La similitud fue alta, pero no mejoró lo suficiente contra el baseline inicial."
-        elif best_similarity_score >= float(similarity_threshold) and not enough_change:
-            decision = "rejected_similarity_without_change"
-            reason = "La similitud visual no fue suficiente porque la ROI no cambió temporalmente; evita falsos positivos de fondo."
-        elif not enough_combined:
-            decision = "rejected_low_combined_score"
-            reason = "El puntaje combinado de cambio temporal y similitud quedó bajo el umbral."
+        bootstrap_visual_threshold = max(float(similarity_threshold) + 0.12, 0.72)
+        bootstrap_roi_threshold = 0.40
+        bootstrap_roi_candidate = bool(
+            best_roi_object_score >= bootstrap_roi_threshold
+            and best_dark_structure_penalty < 0.45
+        )
+        if not require_change:
+            present = False
+            if enough_similarity and best_similarity_score >= bootstrap_visual_threshold and bootstrap_roi_candidate:
+                decision = "bootstrap_candidate_requires_change_validation"
+                reason = (
+                    "La ROI se parece al objeto, pero este primer microclip solo se usa como baseline. "
+                    "Se necesita cambio temporal posterior para confirmarlo con confianza."
+                )
+                candidate_confidence = "candidate"
+            else:
+                decision = "baseline_bootstrap_without_confident_object"
+                reason = (
+                    "Este primer microclip se tomó como referencia temporal. "
+                    "No hubo evidencia suficientemente específica para confirmar el objeto en este punto."
+                )
+                candidate_confidence = "rejected"
+            candidate_reason = reason
         else:
-            decision = "rejected_low_change_score"
-            reason = "El cambio temporal dentro de la ROI quedó bajo el umbral."
-        if present:
-            candidate_confidence = "confirmed"
-        elif visual_manual_candidate or dark_manual_candidate:
-            candidate_confidence = "candidate"
-        else:
-            candidate_confidence = "rejected"
-        candidate_reason = reason
+            present = bool(specific_change_support or specific_probe_support or visual_recovery_support)
+            if present and structural_dark_mass:
+                decision = "present_by_specific_similarity_gain_despite_structural_dark"
+                reason = (
+                    "La masa oscura tiene rasgos estructurales, pero la similitud contra la referencia subió "
+                    "lo suficiente frente al baseline para confirmarla."
+                )
+            elif present and visual_recovery_support and not enough_dark_gain:
+                decision = "present_by_persistent_visual_support"
+                reason = (
+                    "La ROI mostró coincidencia visual persistente del objeto a lo largo del microclip "
+                    "y suficiente cambio frente al baseline para confirmarlo aunque la masa oscura no fuera dominante."
+                )
+            elif present and enough_change and enough_dark_gain and enough_dark_area_gain:
+                decision = "present_by_roi_dark_specific_change"
+                reason = (
+                    "La ROI tuvo cambio temporal específico, aumento de masa oscura frente al baseline "
+                    "y soporte mínimo del matcher visual."
+                )
+            elif present and enough_similarity and enough_similarity_gain and not enough_change:
+                decision = "present_by_similarity_gain"
+                reason = (
+                    "La ROI no tuvo un cambio global alto, pero la similitud contra la referencia subió claramente "
+                    "frente al baseline inicial."
+                )
+            elif present:
+                decision = "present_by_temporal_change"
+                reason = "La ROI cambió respecto a la referencia temporal y la similitud visual apoyó la decisión."
+            elif visual_manual_candidate:
+                decision = "candidate_persistent_visual_manual_review"
+                reason = (
+                    "La ROI mostró coincidencia visual persistente del objeto, pero todavía no alcanzó señal temporal "
+                    "suficiente para confirmarlo automáticamente."
+                )
+            elif dark_manual_candidate:
+                decision = "candidate_dark_structural_mass_manual_review"
+                reason = (
+                    "La ROI contiene una masa oscura persistente, pero es grande/estructural o pegada a bordes "
+                    "y no tiene suficiente cambio/similitud específica para confirmarla como objeto abandonado."
+                )
+            elif not visual_support:
+                decision = "rejected_without_visual_support"
+                reason = "No hubo suficiente masa oscura persistente en la ROI ni soporte visual mínimo del matcher."
+            elif enough_similarity and not enough_similarity_gain:
+                decision = "rejected_similarity_without_baseline_gain"
+                reason = "La similitud fue alta, pero no mejoró lo suficiente contra el baseline inicial."
+            elif best_similarity_score >= float(similarity_threshold) and not enough_change:
+                decision = "rejected_similarity_without_change"
+                reason = "La similitud visual no fue suficiente porque la ROI no cambió temporalmente; evita falsos positivos de fondo."
+            elif not enough_combined:
+                decision = "rejected_low_combined_score"
+                reason = "El puntaje combinado de cambio temporal y similitud quedó bajo el umbral."
+            else:
+                decision = "rejected_low_change_score"
+                reason = "El cambio temporal dentro de la ROI quedó bajo el umbral."
+            if present:
+                candidate_confidence = "confirmed"
+            elif visual_manual_candidate or dark_manual_candidate:
+                candidate_confidence = "candidate"
+            else:
+                candidate_confidence = "rejected"
+            candidate_reason = reason
 
     return {
         "ok": True,

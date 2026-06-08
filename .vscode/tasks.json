@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Innova Investigation API",
+      "type": "shell",
+      "command": "${workspaceFolder}/innova-ai-investigation-runtime/.venv/bin/python",
+      "args": ["-m", "innova_investigation"],
+      "options": {
+        "cwd": "${workspaceFolder}/innova-ai-investigation-runtime"
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false
+      }
+    },
+    {
+      "label": "Bootstrap Innova Investigation Env",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/bootstrap_local_env.sh"],
+      "options": {
+        "cwd": "${workspaceFolder}/innova-ai-investigation-runtime"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

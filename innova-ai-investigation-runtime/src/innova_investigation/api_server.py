@@ -42,6 +42,8 @@ from .bridges.uniview import (
     list_channels as list_uniview_channels,
 )
 from .investigation_api_engine import (
+    _prefer_native_clip_variant,
+    ensure_analysis_clip,
     ensure_openable_clip,
     extract_video_segment,
     format_seconds,
@@ -49,6 +51,7 @@ from .investigation_api_engine import (
     quick_scan_clip,
     run_deep_analysis,
 )
+from .event_monitor.api import register_event_monitor
 from .similarity_search import SimilaritySearcher
 
 try:
@@ -71,7 +74,14 @@ STATIC_DISCOVERY_MAX_SAFE_CANDIDATE_WINDOW_SECONDS = max(
 )
 STATIC_DISCOVERY_MIN_ROI_AREA = 0.0025
 STATIC_DISCOVERY_MAX_ROI_AREA = 0.80
-FIRST_APPEARANCE_MAX_INITIAL_CLIP_SECONDS = 1800.0
+FIRST_APPEARANCE_MAX_INITIAL_CLIP_SECONDS = max(
+    60.0,
+    float(os.getenv("FIRST_APPEARANCE_MAX_INITIAL_CLIP_SECONDS", "300") or 300),
+)
+BROWSER_TRANSCODE_MAX_BYTES = max(
+    1,
+    int(float(os.getenv("INNOVA_BROWSER_TRANSCODE_MAX_MB", "80") or 80) * 1024 * 1024),
+)
 
 
 def _parse_iso_dt(value: str) -> datetime:
@@ -174,6 +184,59 @@ def _load_backend_nvr_profile(nvr_id: str | int | None) -> dict[str, Any] | None
         return None
 
 
+def _load_backend_nvr_profile_by_hint(
+    *,
+    nvr_name: str,
+    property_id: str | int | None,
+    property_name: str,
+    host: str,
+) -> dict[str, Any] | None:
+    def norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    target_name = norm(nvr_name)
+    target_property_id = str(property_id or "").strip()
+    target_property_name = norm(property_name)
+    target_host = norm(host)
+
+    if not any((target_name, target_property_id, target_property_name, target_host)):
+        return None
+
+    try:
+        response = requests.get(f"{BACKEND_API_BASE_URL}/nvrs", timeout=5)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+
+    nvrs = payload if isinstance(payload, list) else []
+    best_id: Any = None
+    for item in nvrs:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        item_property = item.get("property") if isinstance(item.get("property"), dict) else {}
+        item_property_id = str(item.get("propertyId") or item_property.get("id") or "").strip()
+        item_property_name = norm(item.get("propertyName") or item_property.get("name"))
+        item_name = norm(item.get("name"))
+        item_host = norm(item.get("host"))
+
+        if target_host and item_host == target_host:
+            best_id = item_id
+            break
+        if target_name and item_name == target_name:
+            best_id = item_id
+            break
+        if target_property_id and item_property_id == target_property_id and (target_name in item_name or item_name in target_property_name):
+            best_id = item_id
+            break
+        if target_property_name and item_property_name == target_property_name and (target_name in item_name or item_name in target_property_name):
+            best_id = item_id
+            break
+
+    return _load_backend_nvr_profile(best_id)
+
+
 @dataclass(slots=True)
 class JobState:
     job_id: str
@@ -185,6 +248,8 @@ class JobState:
     progress: float = 0.0
     error: str = ""
     result: dict[str, Any] | None = None
+    partial_result: dict[str, Any] | None = None
+    cancel_requested: bool = False
     base_url: str = ""
     job_dir: Path = field(default_factory=Path)
 
@@ -200,6 +265,10 @@ class JobState:
         }
         if self.status == "error":
             payload["error"] = self.error or "Job failed"
+        if self.status == "cancelled":
+            payload["cancelled"] = True
+        if self.status == "running" and self.partial_result is not None:
+            payload["partialResult"] = self.partial_result
         if self.status == "done" and self.result is not None:
             payload["result"] = self.result
         return payload
@@ -229,9 +298,36 @@ def _update_job(job_id: str, *, stage: str | None = None, detail: str | None = N
         job.updated_at = _now_iso()
 
 
+def _update_job_partial(job_id: str, partial_result: dict[str, Any]) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.partial_result = partial_result
+        job.updated_at = _now_iso()
+
+
+def _job_cancel_requested(job_id: str) -> bool:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return bool(job and job.cancel_requested)
+
+
 def _artifact_url(job: JobState, relative_path: Path) -> str:
     rel = relative_path.as_posix().lstrip("/")
     return f"{job.base_url}/investigation/artifacts/{job.job_id}/{rel}"
+
+
+def _resolve_public_api_base(request: Request) -> str:
+    configured = str(getattr(runtime_config, "PUBLIC_API_BASE_URL", "") or "").strip().rstrip("/")
+    if configured:
+        return configured
+
+    base = str(request.base_url).rstrip("/")
+    forwarded_prefix = str(request.headers.get("x-forwarded-prefix", "") or "").strip().rstrip("/")
+    if forwarded_prefix:
+        return f"{base}{forwarded_prefix}"
+    return f"{base}/api"
 
 
 def _artifact_url_for_path(job: JobState, path: str | Path | None) -> str:
@@ -254,6 +350,8 @@ def _artifact_url_for_openable_video_path(job: JobState, path: str | Path | None
         if not source.exists():
             return ""
         if source.suffix.lower() not in VIDEO_ARTIFACT_EXTENSIONS:
+            return _artifact_url(job, source.relative_to(job.job_dir))
+        if source.stat().st_size > BROWSER_TRANSCODE_MAX_BYTES:
             return _artifact_url(job, source.relative_to(job.job_dir))
         browser_candidate = source.parent / f"{source.stem}_browser.mp4"
         if browser_candidate.exists() and browser_candidate.resolve() != source.resolve():
@@ -550,10 +648,7 @@ def _rewrite_paths_to_urls(job: JobState, payload: dict[str, Any]) -> dict[str, 
                 track2[report_key] = _convert_report_paths(job, report)
         deep_track = track2.get("deep")
         if isinstance(deep_track, dict):
-            deep_track2 = dict(deep_track)
-            top_hits = deep_track2.get("top_hits") or []
-            if isinstance(top_hits, list):
-                deep_track2["top_hits"] = [convert_hit(item) for item in top_hits if isinstance(item, dict)]
+            deep_track2 = _convert_report_paths(job, deep_track)
             matches = deep_track2.get("matches") or []
             if isinstance(matches, list):
                 deep_track2["matches"] = [convert_people(convert_hit(item)) for item in matches if isinstance(item, dict)]
@@ -664,6 +759,9 @@ def _pick_hit_from_result(
                 static_hits,
                 key=lambda item: abs(float(item.get("absolute_seconds", 0.0) or 0.0) - float(selected_absolute_seconds)),
             )
+        transition_hit = _build_static_transition_hit_from_result(result_payload)
+        if transition_hit:
+            return transition_hit
         return static_hits[0]
     return None
 
@@ -683,6 +781,37 @@ def _parse_optional_dt(value: Any) -> datetime | None:
         return _parse_iso_dt(raw)
     except Exception:
         return None
+
+
+def _static_candidate_window_from_result(result_payload: dict[str, Any]) -> dict[str, Any] | None:
+    static_discovery = result_payload.get("static_discovery")
+    if isinstance(static_discovery, dict) and isinstance(static_discovery.get("candidateWindow"), dict):
+        return dict(static_discovery.get("candidateWindow") or {})
+    if isinstance(result_payload.get("candidateWindow"), dict):
+        return dict(result_payload.get("candidateWindow") or {})
+    return None
+
+
+def _build_static_transition_hit_from_result(result_payload: dict[str, Any]) -> dict[str, Any] | None:
+    candidate_window = _static_candidate_window_from_result(result_payload)
+    if not isinstance(candidate_window, dict):
+        return None
+
+    post_check = candidate_window.get("postAppearanceCheck")
+    transition_hit = _build_static_hit_from_check(post_check) if isinstance(post_check, dict) else None
+    start_offset = _safe_float(candidate_window.get("startOffsetSeconds"))
+    end_offset = _safe_float(candidate_window.get("endOffsetSeconds"))
+    if transition_hit is None:
+        transition_hit = {}
+    if start_offset is not None and end_offset is not None and end_offset >= start_offset:
+        transition_hit["absolute_seconds"] = round((start_offset + end_offset) / 2.0, 2)
+        transition_hit["transition_start_seconds"] = round(start_offset, 2)
+        transition_hit["transition_end_seconds"] = round(end_offset, 2)
+    elif "absolute_seconds" not in transition_hit:
+        return None
+    transition_hit["static_candidate_window"] = candidate_window
+    transition_hit["static_check_label"] = transition_hit.get("static_check_label") or "candidate_window"
+    return transition_hit
 
 
 def _resolve_job_artifact_path(job: JobState, value: Any) -> Path | None:
@@ -1335,6 +1464,292 @@ def _detect_people(frame: np.ndarray) -> list[dict[str, Any]]:
     return detections
 
 
+INTERACTION_CLASS_IDS = [0, 2, 3, 5, 7]
+INTERACTION_VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "motorbike"}
+
+
+def _detect_interaction_objects(frame: np.ndarray, *, min_confidence: float = 0.28) -> list[dict[str, Any]]:
+    if frame.size == 0:
+        return []
+    detector = _get_person_detector()
+    results = detector.predict(
+        frame,
+        classes=INTERACTION_CLASS_IDS,
+        conf=float(min_confidence),
+        device=str(getattr(runtime_config, "PERSON_DETECTION_DEVICE", "cpu")),
+        verbose=False,
+    )
+    detections: list[dict[str, Any]] = []
+    height, width = frame.shape[:2]
+    names = getattr(detector, "names", {}) or {}
+    for result in results:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            continue
+        for box in boxes:
+            class_id = int(box.cls[0].detach().cpu().item()) if getattr(box, "cls", None) is not None else -1
+            class_name = str(names.get(class_id, class_id))
+            xyxy = box.xyxy[0].detach().cpu().numpy().astype(int).tolist()
+            x1, y1, x2, y2 = xyxy[:4]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            conf = float(box.conf[0].detach().cpu().item()) if getattr(box, "conf", None) is not None else 0.0
+            detections.append(
+                {
+                    "classId": class_id,
+                    "className": class_name,
+                    "confidence": round(conf, 4),
+                    "bbox": [x1, y1, x2, y2],
+                }
+            )
+    return detections
+
+
+def _normalized_roi_to_pixels(frame_shape: tuple[int, int], roi: dict[str, Any]) -> tuple[int, int, int, int]:
+    height, width = frame_shape[:2]
+    x = float(roi.get("x", 0.0) or 0.0)
+    y = float(roi.get("y", 0.0) or 0.0)
+    roi_width = float(roi.get("width", 0.0) or 0.0)
+    roi_height = float(roi.get("height", 0.0) or 0.0)
+    x1 = max(0, min(width - 1, int(round(x * width))))
+    y1 = max(0, min(height - 1, int(round(y * height))))
+    x2 = max(x1 + 1, min(width, int(round((x + roi_width) * width))))
+    y2 = max(y1 + 1, min(height, int(round((y + roi_height) * height))))
+    return x1, y1, x2, y2
+
+
+def _expand_box(box: tuple[int, int, int, int], frame_shape: tuple[int, int], *, scale: float = 0.55) -> tuple[int, int, int, int]:
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = box
+    pad_x = int(round((x2 - x1) * scale))
+    pad_y = int(round((y2 - y1) * scale))
+    return (
+        max(0, x1 - pad_x),
+        max(0, y1 - pad_y),
+        min(width, x2 + pad_x),
+        min(height, y2 + pad_y),
+    )
+
+
+def _box_intersection_ratio(a: list[int] | tuple[int, ...], b: list[int] | tuple[int, ...]) -> float:
+    ax1, ay1, ax2, ay2 = [float(value) for value in a[:4]]
+    bx1, by1, bx2, by2 = [float(value) for value in b[:4]]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    return float(inter / area_a)
+
+
+def _annotate_interaction_frame(
+    frame: np.ndarray,
+    *,
+    roi_box: tuple[int, int, int, int],
+    expanded_box: tuple[int, int, int, int],
+    detections: list[dict[str, Any]],
+    label: str,
+) -> np.ndarray:
+    annotated = frame.copy()
+    ex1, ey1, ex2, ey2 = expanded_box
+    rx1, ry1, rx2, ry2 = roi_box
+    cv2.rectangle(annotated, (ex1, ey1), (ex2, ey2), (90, 120, 255), 2)
+    cv2.rectangle(annotated, (rx1, ry1), (rx2, ry2), runtime_config.BRAND_GOLD, 3)
+    for detection in detections:
+        x1, y1, x2, y2 = [int(value) for value in detection.get("bbox", [0, 0, 0, 0])]
+        class_name = str(detection.get("className") or "object")
+        confidence = float(detection.get("confidence", 0.0) or 0.0)
+        color = (0, 220, 255) if class_name in INTERACTION_VEHICLE_CLASSES else (80, 220, 120)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            annotated,
+            f"{class_name} {confidence:.2f}",
+            (x1, max(24, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    cv2.putText(
+        annotated,
+        label,
+        (max(10, rx1), max(28, ry1 - 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.68,
+        runtime_config.BRAND_GOLD,
+        2,
+        cv2.LINE_AA,
+    )
+    return annotated
+
+
+def _scan_clip_for_roi_interactions(
+    *,
+    video_path: Path,
+    output_dir: Path,
+    roi: dict[str, Any],
+    chunk_start_dt: datetime,
+    range_start_dt: datetime,
+    sample_every_seconds: float,
+    pre_post_seconds: float,
+    max_events: int = 8,
+    on_progress: Any | None = None,
+    should_cancel: Any | None = None,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = output_dir / "frames"
+    clips_dir = output_dir / "clips"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"No pude abrir el clip para ROI interaction search: {video_path}")
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 1.0)
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration_seconds = total_frames / fps if fps > 0 else 0.0
+    frame_step = max(1, int(round(max(float(sample_every_seconds), 0.4) * fps)))
+
+    events: list[dict[str, Any]] = []
+    prev_gray: np.ndarray | None = None
+    last_event_second = -9999.0
+    sampled = 0
+    frame_index = 0
+    roi_box: tuple[int, int, int, int] | None = None
+    expanded_box: tuple[int, int, int, int] | None = None
+
+    try:
+        while frame_index < max(total_frames, 1):
+            if should_cancel and should_cancel():
+                break
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                frame_index += frame_step
+                continue
+            sampled += 1
+            timestamp_seconds = frame_index / fps if fps else 0.0
+            if roi_box is None or expanded_box is None:
+                roi_box = _normalized_roi_to_pixels(frame.shape[:2], roi)
+                expanded_box = _expand_box(roi_box, frame.shape[:2], scale=0.65)
+
+            ex1, ey1, ex2, ey2 = expanded_box
+            roi_frame = frame[ey1:ey2, ex1:ex2]
+            if roi_frame.size == 0:
+                frame_index += frame_step
+                continue
+            gray = cv2.cvtColor(cv2.resize(roi_frame, (220, 160), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            motion_score = 0.0
+            if prev_gray is not None:
+                diff = cv2.absdiff(prev_gray, gray)
+                motion_score = float(np.mean(diff) / 255.0)
+            prev_gray = gray
+
+            should_probe = motion_score >= 0.030
+            if should_probe and (timestamp_seconds - last_event_second) >= max(6.0, pre_post_seconds * 0.65):
+                detections = _detect_interaction_objects(frame, min_confidence=0.25)
+                relevant: list[dict[str, Any]] = []
+                proximity_score = 0.0
+                vehicle_near = False
+                person_near = False
+                assert roi_box is not None and expanded_box is not None
+                for detection in detections:
+                    bbox = detection.get("bbox") or []
+                    if len(bbox) < 4:
+                        continue
+                    expanded_overlap = _box_intersection_ratio(bbox, expanded_box)
+                    roi_overlap = _box_intersection_ratio(bbox, roi_box)
+                    if expanded_overlap <= 0.02 and roi_overlap <= 0.0:
+                        continue
+                    item = dict(detection)
+                    item["expandedRoiOverlap"] = round(expanded_overlap, 4)
+                    item["targetRoiOverlap"] = round(roi_overlap, 4)
+                    relevant.append(item)
+                    proximity_score = max(proximity_score, min(1.0, (expanded_overlap * 0.65) + (roi_overlap * 1.2)))
+                    class_name = str(item.get("className") or "").lower()
+                    vehicle_near = vehicle_near or class_name in INTERACTION_VEHICLE_CLASSES
+                    person_near = person_near or class_name == "person"
+
+                if relevant or motion_score >= 0.055:
+                    confidence = min(
+                        0.98,
+                        (motion_score * 9.0)
+                        + (0.24 if vehicle_near else 0.0)
+                        + (0.10 if person_near else 0.0)
+                        + (0.30 * proximity_score),
+                    )
+                    reasons: list[str] = []
+                    if motion_score >= 0.055:
+                        reasons.append("strong ROI motion/change")
+                    else:
+                        reasons.append("ROI motion/change")
+                    if vehicle_near:
+                        reasons.append("vehicle near selected target")
+                    if person_near:
+                        reasons.append("person near selected target")
+                    if proximity_score > 0.12:
+                        reasons.append("object overlaps expanded target area")
+
+                    event_number = len(events) + 1
+                    absolute_dt = chunk_start_dt + timedelta(seconds=timestamp_seconds)
+                    absolute_seconds = (absolute_dt - range_start_dt).total_seconds()
+                    frame_path = frames_dir / f"event_{event_number:03d}_{absolute_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+                    annotated = _annotate_interaction_frame(
+                        frame,
+                        roi_box=roi_box,
+                        expanded_box=expanded_box,
+                        detections=relevant,
+                        label=f"Interaction candidate {confidence:.2f}",
+                    )
+                    cv2.imwrite(str(frame_path), annotated)
+                    clip_path = clips_dir / f"event_{event_number:03d}_{absolute_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
+                    try:
+                        clip_path = extract_video_segment(
+                            source_video=video_path,
+                            output_video=clip_path,
+                            start_seconds=max(0.0, timestamp_seconds - pre_post_seconds),
+                            end_seconds=min(duration_seconds, timestamp_seconds + pre_post_seconds),
+                        )
+                    except Exception:
+                        clip_path = Path("")
+
+                    events.append(
+                        {
+                            "eventId": f"roi-event-{event_number:03d}",
+                            "timestamp": _dt_to_payload(absolute_dt),
+                            "timestampSeconds": round(timestamp_seconds, 2),
+                            "absoluteSeconds": round(absolute_seconds, 2),
+                            "confidence": round(float(confidence), 4),
+                            "reason": ", ".join(reasons),
+                            "objectsDetected": relevant,
+                            "motionScore": round(float(motion_score), 4),
+                            "proximityScore": round(float(proximity_score), 4),
+                            "frame_path": str(frame_path),
+                            "clip_path": str(clip_path) if clip_path else "",
+                            "roi": roi,
+                        }
+                    )
+                    last_event_second = timestamp_seconds
+                    if len(events) >= max_events:
+                        break
+
+            if on_progress and sampled % 6 == 0:
+                on_progress(frame_index / max(total_frames, 1))
+            frame_index += frame_step
+    finally:
+        capture.release()
+
+    return {
+        "ok": True,
+        "durationSeconds": round(duration_seconds, 2),
+        "framesReviewed": sampled,
+        "events": events,
+    }
+
+
 def _score_person_crop(
     searcher: SimilaritySearcher,
     query_signatures: list[dict[str, Any]],
@@ -1395,6 +1810,118 @@ def _draw_person_hit(frame: np.ndarray, hit: dict[str, Any]) -> np.ndarray:
         cv2.LINE_AA,
     )
     return annotated
+
+
+def _bbox_center(bbox: list[int] | tuple[int, ...]) -> tuple[float, float]:
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _bbox_iou(a: list[int] | tuple[int, ...], b: list[int] | tuple[int, ...]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a[:4]]
+    bx1, by1, bx2, by2 = [float(v) for v in b[:4]]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return float(inter / max(1.0, area_a + area_b - inter))
+
+
+def _group_person_hits_into_tracks(
+    hits: list[dict[str, Any]],
+    *,
+    max_time_gap_seconds: float = 3.0,
+    min_iou: float = 0.08,
+) -> list[dict[str, Any]]:
+    """Collapse repeated frame detections into review-friendly person tracks."""
+    tracks: list[dict[str, Any]] = []
+    ordered_hits = sorted(
+        [item for item in hits if isinstance(item, dict) and item.get("bbox")],
+        key=lambda item: float(item.get("absolute_seconds", item.get("timestamp_seconds", 0.0)) or 0.0),
+    )
+    for hit in ordered_hits:
+        bbox = hit.get("bbox") or [0, 0, 0, 0]
+        hit_time = float(hit.get("absolute_seconds", hit.get("timestamp_seconds", 0.0)) or 0.0)
+        hit_center = _bbox_center(bbox)
+        hit_w = max(1.0, float(bbox[2] - bbox[0]))
+        hit_h = max(1.0, float(bbox[3] - bbox[1]))
+        max_center_shift = max(90.0, ((hit_w * hit_w + hit_h * hit_h) ** 0.5) * 0.85)
+
+        best_track: dict[str, Any] | None = None
+        best_score = -1.0
+        for track in tracks:
+            last_hit = track.get("last_hit") or {}
+            last_bbox = last_hit.get("bbox") or []
+            if len(last_bbox) < 4:
+                continue
+            last_time = float(last_hit.get("absolute_seconds", last_hit.get("timestamp_seconds", 0.0)) or 0.0)
+            time_gap = abs(hit_time - last_time)
+            if time_gap > max_time_gap_seconds:
+                continue
+            last_center = _bbox_center(last_bbox)
+            center_distance = ((hit_center[0] - last_center[0]) ** 2 + (hit_center[1] - last_center[1]) ** 2) ** 0.5
+            iou = _bbox_iou(bbox, last_bbox)
+            if iou < min_iou and center_distance > max_center_shift:
+                continue
+            continuity_score = (iou * 3.0) + max(0.0, 1.0 - (center_distance / max_center_shift))
+            if continuity_score > best_score:
+                best_track = track
+                best_score = continuity_score
+
+        if best_track is None:
+            track_id = len(tracks) + 1
+            best_track = {
+                "track_id": track_id,
+                "hits": [],
+                "last_hit": None,
+            }
+            tracks.append(best_track)
+
+        hit["track_id"] = int(best_track["track_id"])
+        best_track["hits"].append(hit)
+        best_track["last_hit"] = hit
+
+    summaries: list[dict[str, Any]] = []
+    for track in tracks:
+        track_hits = [item for item in track.get("hits", []) if isinstance(item, dict)]
+        if not track_hits:
+            continue
+        best_hit = max(
+            track_hits,
+            key=lambda item: (
+                float(item.get("score", 0.0) or 0.0),
+                -float(item.get("absolute_seconds", item.get("timestamp_seconds", 0.0)) or 0.0),
+            ),
+        )
+        first_hit = min(track_hits, key=lambda item: float(item.get("absolute_seconds", 0.0) or 0.0))
+        last_hit = max(track_hits, key=lambda item: float(item.get("absolute_seconds", 0.0) or 0.0))
+        summaries.append(
+            {
+                "track_id": int(track["track_id"]),
+                "hit_count": len(track_hits),
+                "first_seen_seconds": first_hit.get("absolute_seconds"),
+                "last_seen_seconds": last_hit.get("absolute_seconds"),
+                "first_seen_label": first_hit.get("absolute_label") or first_hit.get("timestamp_label") or "",
+                "last_seen_label": last_hit.get("absolute_label") or last_hit.get("timestamp_label") or "",
+                "best_score": best_hit.get("score", 0.0),
+                "best_hit": best_hit,
+                "sample_hits": sorted(
+                    track_hits,
+                    key=lambda item: (-float(item.get("score", 0.0) or 0.0), float(item.get("absolute_seconds", 0.0) or 0.0)),
+                )[:6],
+            }
+        )
+    summaries.sort(
+        key=lambda item: (
+            -float(item.get("best_score", 0.0) or 0.0),
+            -int(item.get("hit_count", 0) or 0),
+            float(item.get("first_seen_seconds", 0.0) or 0.0),
+        )
+    )
+    return summaries
 
 
 def _scan_clip_for_person_references(
@@ -1492,8 +2019,17 @@ def _scan_clip_for_person_references(
     finally:
         capture.release()
 
+    person_tracks = _group_person_hits_into_tracks(hits)
+    track_representatives = [
+        track.get("best_hit")
+        for track in person_tracks
+        if isinstance(track.get("best_hit"), dict)
+    ]
+    track_representatives.sort(
+        key=lambda item: (-float(item.get("score", 0.0)), float(item.get("absolute_seconds", 0.0)))
+    )
     hits.sort(key=lambda item: (-float(item.get("score", 0.0)), float(item.get("absolute_seconds", 0.0))))
-    top_hits = hits[:keep_top]
+    top_hits = (track_representatives or hits)[:keep_top]
     earliest = min(top_hits, key=lambda item: float(item.get("absolute_seconds", 0.0))) if top_hits else None
     return {
         "ok": True,
@@ -1503,6 +2039,8 @@ def _scan_clip_for_person_references(
         "frames_reviewed": sampled,
         "references_used": len(queries),
         "matches_found": len(hits),
+        "tracks_found": len(person_tracks),
+        "person_tracks": person_tracks,
         "earliest_hit": earliest,
         "top_hits": top_hits,
     }
@@ -1586,13 +2124,25 @@ def _scan_clip_for_person_candidates(
     finally:
         capture.release()
 
+    person_tracks = _group_person_hits_into_tracks(hits)
+    track_representatives = [
+        track.get("best_hit")
+        for track in person_tracks
+        if isinstance(track.get("best_hit"), dict)
+    ]
+    track_representatives.sort(
+        key=lambda item: (
+            -float(item.get("score", 0.0)),
+            float(item.get("absolute_seconds", 0.0)),
+        )
+    )
     hits.sort(
         key=lambda item: (
             -float(item.get("score", 0.0)),
             float(item.get("absolute_seconds", 0.0)),
         )
     )
-    top_hits = hits[:keep_top]
+    top_hits = (track_representatives or hits)[:keep_top]
     earliest = min(top_hits, key=lambda item: float(item.get("absolute_seconds", 0.0))) if top_hits else None
     return {
         "ok": True,
@@ -1602,6 +2152,8 @@ def _scan_clip_for_person_candidates(
         "frames_reviewed": sampled,
         "references_used": 0,
         "matches_found": len(hits),
+        "tracks_found": len(person_tracks),
+        "person_tracks": person_tracks,
         "earliest_hit": earliest,
         "top_hits": top_hits,
     }
@@ -1652,6 +2204,25 @@ def _convert_report_paths(job: JobState, report: dict[str, Any]) -> dict[str, An
     earliest = updated_report.get("earliest_hit")
     if isinstance(earliest, dict):
         updated_report["earliest_hit"] = convert_hit(earliest)
+    tracks = updated_report.get("person_tracks") or []
+    if isinstance(tracks, list):
+        converted_tracks: list[dict[str, Any]] = []
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            updated_track = dict(track)
+            best_hit = updated_track.get("best_hit")
+            if isinstance(best_hit, dict):
+                updated_track["best_hit"] = convert_hit(best_hit)
+            sample_hits = updated_track.get("sample_hits") or []
+            if isinstance(sample_hits, list):
+                updated_track["sample_hits"] = [
+                    convert_hit(item) for item in sample_hits if isinstance(item, dict)
+                ]
+            updated_track.pop("hits", None)
+            updated_track.pop("last_hit", None)
+            converted_tracks.append(updated_track)
+        updated_report["person_tracks"] = converted_tracks
     return updated_report
 
 
@@ -1662,6 +2233,13 @@ class DeepSearchRequest(BaseModel):
     investigationRadius: float = 25.0
     similarityThreshold: float = 0.58
     preferWindow: bool = False
+
+
+def _person_context_window_seconds(radius: float) -> tuple[float, float]:
+    safe_radius = max(10.0, float(radius or 25.0))
+    before_seconds = min(75.0, max(30.0, safe_radius * 1.5))
+    after_seconds = min(75.0, max(30.0, safe_radius * 1.5))
+    return before_seconds, after_seconds
 
 
 class TrackPersonRequest(BaseModel):
@@ -1955,6 +2533,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+register_event_monitor(app)
+
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
@@ -2070,6 +2650,337 @@ def bridge_fetch_snapshot(payload: BridgeSnapshotRequest) -> dict[str, Any]:
     )
 
 
+@app.post("/api/investigation/roi-interaction-search")
+async def start_roi_interaction_search(
+    request: Request,
+    background: BackgroundTasks,
+    propertyId: str = Form(""),
+    propertyName: str = Form(""),
+    vendor: str = Form(...),
+    host: str = Form(""),
+    httpPort: int = Form(0),
+    sdkPort: int = Form(0),
+    nvrName: str = Form(""),
+    nvrId: str = Form(""),
+    username: str = Form(""),
+    password: str | None = Form(None),
+    cameraId: str = Form(""),
+    cameraName: str = Form(""),
+    logicalChannel: int = Form(...),
+    startDt: str = Form(...),
+    endDt: str = Form(...),
+    caseName: str = Form("roi-interaction-search"),
+    roi: str = Form(...),
+    interactionType: str = Form("possible_vehicle_impact"),
+    chunkMinutes: float = Form(10.0),
+    sampleEverySeconds: float = Form(1.5),
+    prePostSeconds: float = Form(20.0),
+) -> dict[str, Any]:
+    resolved_vendor = str(vendor or "").strip()
+    resolved_host = str(host or "").strip()
+    resolved_http_port = int(httpPort or 0)
+    resolved_sdk_port = int(sdkPort or 0)
+    resolved_nvr_name = str(nvrName or "").strip()
+
+    backend_profile = _load_backend_nvr_profile(nvrId)
+    if not backend_profile:
+        backend_profile = _load_backend_nvr_profile_by_hint(
+            nvr_name=nvrName,
+            property_id=propertyId,
+            property_name=propertyName,
+            host=host,
+        )
+    if backend_profile:
+        resolved_vendor = str(backend_profile.get("brand") or backend_profile.get("vendor") or resolved_vendor or "").strip()
+        resolved_host = str(backend_profile.get("host") or resolved_host or "").strip()
+        resolved_http_port = int(backend_profile.get("httpPort") or resolved_http_port or 0)
+        resolved_sdk_port = int(backend_profile.get("sdkPort") or resolved_sdk_port or 0)
+        resolved_nvr_name = str(backend_profile.get("name") or resolved_nvr_name or "").strip()
+
+    normalized_vendor = _normalize_vendor(resolved_vendor)
+    if normalized_vendor not in ("hikvision", "dahua"):
+        raise HTTPException(status_code=400, detail=f"Vendor no soportado para ROI interaction search: {resolved_vendor or vendor}")
+
+    resolved_user, resolved_pass = _resolve_nvr_credentials(
+        nvr_id=nvrId,
+        nvr_name=resolved_nvr_name,
+        vendor=normalized_vendor,
+        host=resolved_host,
+        http_port=resolved_http_port,
+        sdk_port=resolved_sdk_port,
+        username=username,
+        password=password,
+    )
+    if not resolved_host or not resolved_sdk_port:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Falta host o sdkPort del NVR. "
+                f"Recibido nvrId={nvrId or '-'}, nvrName={nvrName or '-'}, "
+                f"propertyId={propertyId or '-'}, host={resolved_host or '-'}, "
+                f"sdkPort={resolved_sdk_port or 0}, backendProfile={'yes' if backend_profile else 'no'}."
+            ),
+        )
+    if not resolved_user or not resolved_pass:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Faltan credenciales del NVR para ROI interaction search. "
+                f"Recibido nvrId={nvrId or '-'}, nvrName={resolved_nvr_name or nvrName or '-'}, "
+                f"propertyId={propertyId or '-'}, username={'yes' if resolved_user else 'no'}, "
+                f"password={'yes' if resolved_pass else 'no'}, backendProfile={'yes' if backend_profile else 'no'}."
+            ),
+        )
+
+    try:
+        start_dt = _parse_iso_dt(startDt)
+        end_dt = _parse_iso_dt(endDt)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Fechas inválidas: {exc}") from exc
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="endDt debe ser mayor que startDt.")
+    if start_dt > datetime.now() or end_dt > datetime.now():
+        raise HTTPException(status_code=400, detail="Selecciona una fecha y hora anteriores a la actual.")
+
+    try:
+        normalized_roi = _parse_static_discovery_roi(roi)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    chunk_minutes = _clamp_float(chunkMinutes, default=10.0, min_value=2.0, max_value=30.0)
+    sample_seconds = _clamp_float(sampleEverySeconds, default=1.5, min_value=0.5, max_value=8.0)
+    context_seconds = _clamp_float(prePostSeconds, default=20.0, min_value=5.0, max_value=60.0)
+
+    job_id = uuid.uuid4().hex
+    job_dir = OUTPUT_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job = JobState(
+        job_id=job_id,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        status="running",
+        stage="prepare",
+        detail="Job creado. Preparando ROI interaction search...",
+        progress=0.02,
+        base_url=_resolve_public_api_base(request),
+        job_dir=job_dir,
+    )
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    def runner() -> None:
+        events: list[dict[str, Any]] = []
+        chunks_processed = 0
+        chunks_failed = 0
+        limitations: list[str] = [
+            "AI candidates require human review; this workflow does not make a legal fault determination.",
+            "Low light, occlusion, glare, or low camera angle can hide physical contact.",
+        ]
+        try:
+            with ENGINE_LOCK:
+                downloads_dir = job_dir / "roi_interaction" / "downloads"
+                analysis_dir = job_dir / "roi_interaction" / "analysis"
+                downloads_dir.mkdir(parents=True, exist_ok=True)
+                analysis_dir.mkdir(parents=True, exist_ok=True)
+                bridge = _build_investigation_bridge(normalized_vendor, downloads_dir)
+                total_seconds = max(1.0, (end_dt - start_dt).total_seconds())
+                cursor = start_dt
+                chunk_index = 0
+                consecutive_failures = 0
+                chunk_delta = timedelta(minutes=chunk_minutes)
+
+                while cursor < end_dt:
+                    if _job_cancel_requested(job_id):
+                        break
+                    chunk_index += 1
+                    chunk_start = cursor
+                    chunk_end = min(end_dt, cursor + chunk_delta)
+                    ratio_start = max(0.0, (chunk_start - start_dt).total_seconds() / total_seconds)
+                    ratio_end = max(0.0, (chunk_end - start_dt).total_seconds() / total_seconds)
+                    _update_job(
+                        job_id,
+                        stage="download",
+                        detail=f"Chunk {chunk_index}: descargando {_dt_to_payload(chunk_start)} a {_dt_to_payload(chunk_end)}. Eventos: {len(events)}",
+                        progress=0.04 + (0.88 * ratio_start),
+                    )
+                    chunk_dir = downloads_dir / f"chunk_{chunk_index:04d}"
+                    chunk_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        clip_result = _download_investigation_clip(
+                            vendor=normalized_vendor,
+                            bridge=bridge,
+                            host=resolved_host,
+                            sdk_port=resolved_sdk_port,
+                            username=resolved_user,
+                            password=resolved_pass,
+                            logical_channel=int(logicalChannel),
+                            start_dt=chunk_start,
+                            end_dt=chunk_end,
+                            local_target_dir=chunk_dir,
+                            progress_callback=lambda s, d: _update_job(job_id, stage=s, detail=d),
+                        )
+                        clip_path = ensure_openable_clip(Path(clip_result["final_local_path"]), output_dir=chunk_dir)
+                        scan = _scan_clip_for_roi_interactions(
+                            video_path=clip_path,
+                            output_dir=analysis_dir / f"chunk_{chunk_index:04d}",
+                            roi=normalized_roi,
+                            chunk_start_dt=chunk_start,
+                            range_start_dt=start_dt,
+                            sample_every_seconds=sample_seconds,
+                            pre_post_seconds=context_seconds,
+                            max_events=6,
+                            should_cancel=lambda: _job_cancel_requested(job_id),
+                            on_progress=lambda ratio: _update_job(
+                                job_id,
+                                stage="analysis",
+                                detail=f"Chunk {chunk_index}: analizando ROI {int(max(0.0, min(1.0, ratio)) * 100)}%. Eventos: {len(events)}",
+                                progress=0.04 + (0.88 * (ratio_start + ((ratio_end - ratio_start) * max(0.0, min(1.0, ratio))))),
+                            ),
+                        )
+                        chunks_processed += 1
+                        consecutive_failures = 0
+                        chunk_events = scan.get("events") if isinstance(scan, dict) else []
+                        if isinstance(chunk_events, list):
+                            for event in chunk_events:
+                                if not isinstance(event, dict):
+                                    continue
+                                event2 = dict(event)
+                                event2["eventId"] = f"roi-event-{len(events) + 1:03d}"
+                                event2["chunkIndex"] = chunk_index
+                                event2["chunkStartDt"] = _dt_to_payload(chunk_start)
+                                event2["chunkEndDt"] = _dt_to_payload(chunk_end)
+                                events.append(event2)
+                            events.sort(key=lambda item: (-float(item.get("confidence", 0.0) or 0.0), str(item.get("timestamp") or "")))
+                        if not chunk_events:
+                            for child in chunk_dir.glob("*"):
+                                try:
+                                    if child.is_file():
+                                        child.unlink()
+                                except Exception:
+                                    pass
+
+                        partial_events: list[dict[str, Any]] = []
+                        for event in events[:20]:
+                            event_light = dict(event)
+                            event_light["frameUrl"] = _artifact_url_for_path(job, event_light.get("frame_path"))
+                            event_light["clipUrl"] = _artifact_url_for_openable_video_path(job, event_light.get("clip_path"))
+                            partial_events.append(event_light)
+                        _update_job_partial(
+                            job_id,
+                            {
+                                "mode": "roi_interaction_search",
+                                "events": partial_events,
+                                "summary": {
+                                    "chunksProcessed": chunks_processed,
+                                    "chunksFailed": chunks_failed,
+                                    "eventsFound": len(events),
+                                    "currentChunk": chunk_index,
+                                },
+                            },
+                        )
+                    except Exception as chunk_exc:
+                        chunks_failed += 1
+                        consecutive_failures += 1
+                        failure_detail = (
+                            f"Chunk {chunk_index} falló "
+                            f"({_dt_to_payload(chunk_start)} a {_dt_to_payload(chunk_end)}): {chunk_exc}"
+                        )
+                        limitations.append(failure_detail)
+                        _update_job(
+                            job_id,
+                            stage="download_warning",
+                            detail=failure_detail,
+                            progress=0.04 + (0.88 * ratio_end),
+                        )
+                        _update_job_partial(
+                            job_id,
+                            {
+                                "mode": "roi_interaction_search",
+                                "events": [],
+                                "summary": {
+                                    "chunksProcessed": chunks_processed,
+                                    "chunksFailed": chunks_failed,
+                                    "consecutiveFailures": consecutive_failures,
+                                    "eventsFound": len(events),
+                                    "currentChunk": chunk_index,
+                                    "lastError": failure_detail,
+                                },
+                            },
+                        )
+                    cursor = chunk_end
+
+                final_events: list[dict[str, Any]] = []
+                for event in events[:30]:
+                    event_final = dict(event)
+                    event_final["frameUrl"] = _artifact_url_for_path(job, event_final.get("frame_path"))
+                    event_final["clipUrl"] = _artifact_url_for_openable_video_path(job, event_final.get("clip_path"))
+                    final_events.append(event_final)
+
+                result_payload = {
+                    "job_id": job_id,
+                    "mode": "roi_interaction_search",
+                    "case_name": caseName,
+                    "interactionType": interactionType,
+                    "investigation_context": {
+                        "vendor": normalized_vendor,
+                        "host": resolved_host,
+                        "httpPort": resolved_http_port,
+                        "sdkPort": resolved_sdk_port,
+                        "nvrName": resolved_nvr_name,
+                        "nvrId": str(nvrId or "").strip(),
+                        "cameraId": str(cameraId or "").strip(),
+                        "cameraName": str(cameraName or "").strip(),
+                        "logicalChannel": int(logicalChannel),
+                        "username": resolved_user,
+                    },
+                    "events": final_events,
+                    "summary": {
+                        "rangeStartDt": _dt_to_payload(start_dt),
+                        "rangeEndDt": _dt_to_payload(end_dt),
+                        "durationSeconds": round(total_seconds, 2),
+                        "chunksProcessed": chunks_processed,
+                        "chunksFailed": chunks_failed,
+                        "eventsFound": len(events),
+                        "eventsReturned": len(final_events),
+                        "roi": normalized_roi,
+                        "settings": {
+                            "chunkMinutes": chunk_minutes,
+                            "sampleEverySeconds": sample_seconds,
+                            "prePostSeconds": context_seconds,
+                        },
+                        "limitations": limitations,
+                    },
+                }
+                with JOBS_LOCK:
+                    job2 = JOBS.get(job_id)
+                    if not job2:
+                        return
+                    if job2.cancel_requested:
+                        job2.status = "cancelled"
+                        job2.stage = "cancelled"
+                        job2.detail = "ROI interaction search cancelado por el usuario."
+                    else:
+                        job2.status = "done"
+                        job2.stage = "done"
+                        job2.detail = "ROI interaction search completado."
+                    job2.progress = 1.0 if not job2.cancel_requested else min(0.99, float(job2.progress or 0.0))
+                    job2.result = result_payload
+                    job2.partial_result = None
+                    job2.updated_at = _now_iso()
+        except Exception as exc:
+            with JOBS_LOCK:
+                job2 = JOBS.get(job_id)
+                if job2:
+                    job2.status = "error"
+                    job2.stage = "error"
+                    job2.detail = "ROI interaction search falló."
+                    job2.error = str(exc)
+                    job2.updated_at = _now_iso()
+
+    background.add_task(runner)
+    return {"ok": True, "jobId": job_id, "status": "running"}
+
+
 @app.post("/api/investigation/static-object-discovery")
 async def start_static_object_discovery(
     request: Request,
@@ -2088,7 +2999,7 @@ async def start_static_object_discovery(
     caseName: str = Form("static-object-discovery"),
     similarityThreshold: float = Form(0.58),
     microclipSeconds: float = Form(8.0),
-    targetWindowSeconds: float = Form(60.0),
+    targetWindowSeconds: float = Form(30.0),
     maxIterations: int = Form(12),
     representativeFrames: int = Form(5),
     roi: str = Form(""),
@@ -2153,7 +3064,7 @@ async def start_static_object_discovery(
         min_value=2.0,
         max_value=STATIC_DISCOVERY_MAX_MICROCLIP_SECONDS,
     )
-    target_seconds = max(STATIC_DISCOVERY_MIN_TARGET_WINDOW_SECONDS, float(targetWindowSeconds or 60.0))
+    target_seconds = max(STATIC_DISCOVERY_MIN_TARGET_WINDOW_SECONDS, float(targetWindowSeconds or 30.0))
     iterations_limit = max(1, min(int(maxIterations or 12), STATIC_DISCOVERY_MAX_ITERATIONS))
     representative_frame_count = max(1, min(int(representativeFrames or 5), 12))
     try:
@@ -2174,7 +3085,7 @@ async def start_static_object_discovery(
         raise HTTPException(status_code=400, detail="queryImage vacío.")
     query_path.write_bytes(content)
 
-    base_url = str(request.base_url).rstrip("/") + "/api"
+    base_url = _resolve_public_api_base(request)
     job = JobState(
         job_id=job_id,
         created_at=_now_iso(),
@@ -2357,11 +3268,11 @@ async def start_static_object_discovery(
                     )
                     return (
                         persistent_visual_frames >= 2
-                        and similarity_score >= max(0.24, float(similarityThreshold or 0.58) - 0.18)
+                        and similarity_score >= max(0.30, float(similarityThreshold or 0.58) - 0.14)
                         and (
-                            change_score >= 0.05
-                            or similarity_delta >= 0.04
-                            or roi_object_score >= 0.12
+                            change_score >= 0.08
+                            or similarity_delta >= 0.06
+                            or roi_object_score >= 0.18
                         )
                     )
 
@@ -2467,6 +3378,22 @@ async def start_static_object_discovery(
                 if estimated_window and estimated_window.get("startDt") and estimated_window.get("endDt"):
                     candidate_start_dt = _parse_iso_dt(str(estimated_window["startDt"]))
                     candidate_end_dt = _parse_iso_dt(str(estimated_window["endDt"]))
+                    binary_candidate_start_dt = candidate_start_dt
+                    binary_candidate_end_dt = candidate_end_dt
+                    lower_probe_window = lower_check.get("probeWindow") if isinstance(lower_check.get("probeWindow"), dict) else {}
+                    upper_probe_window = upper_check.get("probeWindow") if isinstance(upper_check.get("probeWindow"), dict) else {}
+                    try:
+                        lower_probe_start_dt = _parse_iso_dt(str(lower_probe_window.get("startDt") or ""))
+                    except Exception:
+                        lower_probe_start_dt = None
+                    try:
+                        upper_probe_end_dt = _parse_iso_dt(str(upper_probe_window.get("endDt") or ""))
+                    except Exception:
+                        upper_probe_end_dt = None
+                    if lower_probe_start_dt and lower_probe_start_dt < candidate_start_dt:
+                        candidate_start_dt = lower_probe_start_dt
+                    if upper_probe_end_dt and upper_probe_end_dt > candidate_end_dt:
+                        candidate_end_dt = upper_probe_end_dt
                     original_candidate_seconds = max(0.0, (candidate_end_dt - candidate_start_dt).total_seconds())
                     candidate_warnings: list[str] = []
                     original_estimated_window: dict[str, Any] | None = None
@@ -2489,6 +3416,23 @@ async def start_static_object_discovery(
                         "durationSeconds": round(candidate_seconds, 2),
                         "preAppearanceCheck": lower_check,
                         "postAppearanceCheck": upper_check,
+                        "binaryCenterWindow": {
+                            "startDt": _dt_to_payload(binary_candidate_start_dt),
+                            "endDt": _dt_to_payload(binary_candidate_end_dt),
+                            "startOffsetSeconds": _offset_seconds(start_dt, binary_candidate_start_dt),
+                            "endOffsetSeconds": _offset_seconds(start_dt, binary_candidate_end_dt),
+                            "durationSeconds": round(
+                                max(0.0, (binary_candidate_end_dt - binary_candidate_start_dt).total_seconds()),
+                                2,
+                            ),
+                        },
+                        "edgeProbeWindow": {
+                            "startDt": _dt_to_payload(candidate_start_dt),
+                            "endDt": _dt_to_payload(candidate_end_dt),
+                            "startOffsetSeconds": _offset_seconds(start_dt, candidate_start_dt),
+                            "endOffsetSeconds": _offset_seconds(start_dt, candidate_end_dt),
+                            "durationSeconds": round(candidate_seconds, 2),
+                        },
                         "nextStep": "run_deep_search_in_candidate_window",
                         "safeWindowPolicy": {
                             "maxCandidateWindowSeconds": STATIC_DISCOVERY_MAX_SAFE_CANDIDATE_WINDOW_SECONDS,
@@ -2595,6 +3539,11 @@ async def start_static_object_discovery(
                 }
 
                 result_payload = _rewrite_paths_to_urls(job, result_payload)
+                try:
+                    with (discovery_dir / "result_full.json").open("w", encoding="utf-8") as file:
+                        json.dump(result_payload, file, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
                 static_discovery = result_payload.get("static_discovery")
                 if isinstance(static_discovery, dict):
                     light_checks = [
@@ -2609,6 +3558,11 @@ async def start_static_object_discovery(
                     result_payload["static_discovery"] = static_discovery
                     result_payload["checks"] = light_checks
                     result_payload["candidateWindow"] = static_discovery.get("candidateWindow")
+                try:
+                    with (discovery_dir / "result.json").open("w", encoding="utf-8") as file:
+                        json.dump(result_payload, file, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
                 with JOBS_LOCK:
                     job2 = JOBS.get(job_id)
                     if not job2:
@@ -2659,7 +3613,7 @@ async def start_first_appearance(
     similarityThreshold: float = Form(0.58),
     deferDeepSearch: bool = Form(False),
     allowLongClip: bool = Form(False),
-    maxInitialClipSeconds: float = Form(1800),
+    maxInitialClipSeconds: float = Form(300),
     queryImage: UploadFile = File(...),
 ) -> dict[str, Any]:
     resolved_vendor = str(vendor or "").strip()
@@ -2741,7 +3695,7 @@ async def start_first_appearance(
         raise HTTPException(status_code=400, detail="queryImage vacío.")
     query_path.write_bytes(content)
 
-    base_url = str(request.base_url).rstrip("/") + "/api"
+    base_url = _resolve_public_api_base(request)
 
     job = JobState(
         job_id=job_id,
@@ -2860,8 +3814,8 @@ async def start_first_appearance(
                             raise
 
                 clip_path = Path(clip_result["final_local_path"])
-                on_progress("normalize", "Preparando clip para análisis (codec/MP4)...", 0.15)
-                clip_path = ensure_openable_clip(clip_path, output_dir=downloads_dir)
+                on_progress("normalize", "Preparando clip para análisis local...", 0.15)
+                clip_path = ensure_analysis_clip(clip_path, output_dir=downloads_dir)
                 on_progress("normalize", "Clip listo para análisis.", 1.0)
 
                 coarse_report = quick_scan_clip(
@@ -2935,8 +3889,8 @@ async def start_first_appearance(
                         frame_step=2,
                         person_trigger_mode="always",
                         person_detection_frame_step=1,
-                        preview_callback_sample_interval=2,
-                        max_results=8,
+                        preview_callback_sample_interval=3,
+                        max_results=6,
                         on_progress=on_progress,
                     )
                     _, first_match = _enrich_deep_matches(deep_report, deep_start=deep_start)
@@ -2984,6 +3938,21 @@ def get_job(job_id: str) -> dict[str, Any]:
         return job.to_payload()
 
 
+@app.post("/api/investigation/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "running":
+            return {"ok": True, "jobId": job_id, "status": job.status}
+        job.cancel_requested = True
+        job.stage = "cancelling"
+        job.detail = "Cancelación solicitada. Cerrando al terminar el microclip actual..."
+        job.updated_at = _now_iso()
+        return {"ok": True, "jobId": job_id, "status": "cancelling"}
+
+
 @app.post("/api/investigation/jobs/{job_id}/deep-search")
 def start_deep_search(
     job_id: str,
@@ -3014,12 +3983,10 @@ def start_deep_search(
     clip = result_payload.get("clip") or {}
     clip_path = Path(str(clip.get("path") or "").strip()) if str(clip.get("path") or "").strip() else None
 
-    static_candidate_window = None
-    static_discovery = result_payload.get("static_discovery")
-    if isinstance(static_discovery, dict) and isinstance(static_discovery.get("candidateWindow"), dict):
-        static_candidate_window = dict(static_discovery.get("candidateWindow") or {})
-    elif isinstance(result_payload.get("candidateWindow"), dict):
-        static_candidate_window = dict(result_payload.get("candidateWindow") or {})
+    static_candidate_window = _static_candidate_window_from_result(result_payload)
+    prefer_static_window = bool(payload.preferWindow and static_candidate_window and static_source_context)
+    if prefer_static_window:
+        selected_hit = _build_static_transition_hit_from_result(result_payload) or selected_hit
 
     if (not clip_path or not clip_path.exists()) and not static_source_context:
         raise HTTPException(
@@ -3074,8 +4041,57 @@ def start_deep_search(
                     fallback_clip_url = ""
                     fallback_clip_start_dt = None
                     fallback_clip_end_dt = None
+                    range_start_dt = None
+                    range_end_dt = None
+                    static_range = (
+                        result_payload.get("static_discovery", {}).get("range")
+                        if isinstance(result_payload.get("static_discovery"), dict)
+                        else {}
+                    )
+                    if isinstance(static_range, dict):
+                        range_start_dt = _parse_optional_dt(static_range.get("startDt"))
+                        range_end_dt = _parse_optional_dt(static_range.get("endDt"))
 
-                    if payload.preferWindow and static_candidate_window:
+                    selected_absolute_seconds = None
+                    if selected_hit:
+                        try:
+                            selected_absolute_seconds = float(
+                                selected_hit.get("absolute_seconds", selected_hit.get("timestamp_seconds", 0.0)) or 0.0
+                            )
+                        except Exception:
+                            selected_absolute_seconds = None
+
+                    if prefer_static_window and static_candidate_window:
+                        candidate_start_dt = _parse_optional_dt(static_candidate_window.get("startDt"))
+                        candidate_end_dt = _parse_optional_dt(static_candidate_window.get("endDt"))
+                        if candidate_start_dt and candidate_end_dt and candidate_end_dt > candidate_start_dt:
+                            before_seconds, after_seconds = _person_context_window_seconds(payload.investigationRadius)
+                            window_start_dt = candidate_start_dt - timedelta(seconds=before_seconds)
+                            window_end_dt = candidate_end_dt + timedelta(seconds=after_seconds)
+                            if range_start_dt:
+                                window_start_dt = max(range_start_dt, window_start_dt)
+                            if range_end_dt:
+                                window_end_dt = min(range_end_dt, window_end_dt)
+                            if range_start_dt:
+                                window_start_offset = max(0.0, (window_start_dt - range_start_dt).total_seconds())
+                                window_end_offset = max(window_start_offset, (window_end_dt - range_start_dt).total_seconds())
+                            else:
+                                window_start_offset = float(static_candidate_window.get("startOffsetSeconds", 0.0) or 0.0)
+                                window_end_offset = float(static_candidate_window.get("endOffsetSeconds", 0.0) or 0.0)
+
+                    if not prefer_static_window and range_start_dt and selected_absolute_seconds is not None:
+                        before_seconds, after_seconds = _person_context_window_seconds(payload.investigationRadius)
+                        anchor_dt = range_start_dt + timedelta(seconds=max(0.0, selected_absolute_seconds))
+                        window_start_dt = anchor_dt - timedelta(seconds=before_seconds)
+                        window_end_dt = anchor_dt + timedelta(seconds=after_seconds)
+                        if range_start_dt:
+                            window_start_dt = max(range_start_dt, window_start_dt)
+                        if range_end_dt:
+                            window_end_dt = min(range_end_dt, window_end_dt)
+                        window_start_offset = max(0.0, (window_start_dt - range_start_dt).total_seconds())
+                        window_end_offset = max(window_start_offset, (window_end_dt - range_start_dt).total_seconds())
+
+                    if (not window_start_dt or not window_end_dt or window_end_dt <= window_start_dt) and static_candidate_window:
                         window_start_dt = _parse_optional_dt(static_candidate_window.get("startDt"))
                         window_end_dt = _parse_optional_dt(static_candidate_window.get("endDt"))
                         window_start_offset = float(static_candidate_window.get("startOffsetSeconds", 0.0) or 0.0)
@@ -3083,14 +4099,6 @@ def start_deep_search(
                         if (window_start_offset <= 0.0 and window_end_offset <= 0.0) and isinstance(
                             static_source_context, dict
                         ):
-                            static_range = (
-                                result_payload.get("static_discovery", {}).get("range")
-                                if isinstance(result_payload.get("static_discovery"), dict)
-                                else {}
-                            )
-                            range_start_dt = _parse_optional_dt(
-                                static_range.get("startDt") if isinstance(static_range, dict) else None
-                            )
                             if range_start_dt and window_start_dt and window_end_dt:
                                 window_start_offset = max(0.0, (window_start_dt - range_start_dt).total_seconds())
                                 window_end_offset = max(0.0, (window_end_dt - range_start_dt).total_seconds())
@@ -3117,8 +4125,16 @@ def start_deep_search(
                         raise RuntimeError("No encontré una ventana válida para profundizar sobre el discovery estático.")
 
                     fallback_artifact = _resolve_job_artifact_path(job, fallback_clip_url) if fallback_clip_url else None
-                    if fallback_artifact and fallback_artifact.exists() and fallback_clip_start_dt and fallback_clip_end_dt:
-                        source_clip_path = ensure_openable_clip(fallback_artifact, output_dir=fallback_artifact.parent)
+                    can_reuse_fallback = (
+                        fallback_artifact
+                        and fallback_artifact.exists()
+                        and fallback_clip_start_dt
+                        and fallback_clip_end_dt
+                        and fallback_clip_start_dt <= window_start_dt
+                        and fallback_clip_end_dt >= window_end_dt
+                    )
+                    if can_reuse_fallback:
+                        source_clip_path = _prefer_native_clip_variant(fallback_artifact)
                     else:
                         resolved_vendor = _normalize_vendor(str(static_source_context.get("vendor") or result_payload.get("vendor") or ""))
                         resolved_host = str(static_source_context.get("host") or "").strip()
@@ -3137,7 +4153,7 @@ def start_deep_search(
                             password=None,
                         )
                         bridge = _build_investigation_bridge(resolved_vendor, downloads_dir)
-                        on_progress("deep_prepare", "Descargando clip corto confirmado para análisis profundo...", 0.08)
+                        on_progress("deep_prepare", "Descargando ventana alrededor del abandono para asociar persona...", 0.08)
                         clip_result = _download_investigation_clip(
                             vendor=resolved_vendor,
                             bridge=bridge,
@@ -3151,11 +4167,21 @@ def start_deep_search(
                             local_target_dir=downloads_dir,
                             progress_callback=lambda stage, detail: _update_job(job_id, stage=stage, detail=detail),
                         )
-                        source_clip_path = ensure_openable_clip(Path(clip_result["final_local_path"]), output_dir=downloads_dir)
+                        source_clip_path = _prefer_native_clip_variant(Path(clip_result["final_local_path"]))
 
                     source_clip_start_offset = max(0.0, float(window_start_offset or 0.0))
                     source_clip_end_offset = max(source_clip_start_offset, float(window_end_offset or 0.0))
-                    if selected_hit:
+                    if prefer_static_window and static_candidate_window:
+                        selected_relative_seconds = max(
+                            0.0,
+                            (
+                                float(static_candidate_window.get("startOffsetSeconds", source_clip_start_offset) or 0.0)
+                                + float(static_candidate_window.get("endOffsetSeconds", source_clip_end_offset) or 0.0)
+                            )
+                            / 2.0
+                            - source_clip_start_offset,
+                        )
+                    elif selected_hit:
                         selected_relative_seconds = max(
                             0.0,
                             float(selected_hit.get("absolute_seconds", selected_hit.get("timestamp_seconds", 0.0)) or 0.0)
@@ -3169,6 +4195,7 @@ def start_deep_search(
 
                 if source_clip_path is None or not source_clip_path.exists():
                     raise RuntimeError("No encontré el clip fuente para ejecutar la búsqueda profunda.")
+                source_clip_path = _prefer_native_clip_variant(source_clip_path)
 
                 if source_analysis_mode == "static_discovery_clip":
                     capture = cv2.VideoCapture(str(source_clip_path))
@@ -3180,15 +4207,13 @@ def start_deep_search(
                     source_duration_seconds = (
                         float(source_total_frames) / source_fps if source_fps > 0 and source_total_frames > 0 else 0.0
                     )
-                    radius = float(payload.investigationRadius or 25.0)
-                    deep_start_relative = max(0.0, selected_relative_seconds - radius)
-                    deep_end_relative = (
-                        min(source_duration_seconds, selected_relative_seconds + radius)
-                        if source_duration_seconds > 0
-                        else selected_relative_seconds + radius
+                    deep_start_relative = 0.0
+                    deep_end_relative = source_duration_seconds or max(
+                        5.0,
+                        float(source_clip_end_offset or 0.0) - float(source_clip_start_offset or 0.0),
                     )
                     if deep_end_relative <= deep_start_relative:
-                        deep_end_relative = deep_start_relative + max(5.0, radius)
+                        deep_end_relative = deep_start_relative + 5.0
                     source_window_start_offset = float(source_clip_start_offset)
                     source_window_end_offset = float(source_clip_end_offset)
                     source_clip_start_offset = source_window_start_offset + deep_start_relative
@@ -3227,8 +4252,8 @@ def start_deep_search(
                     frame_step=2,
                     person_trigger_mode="always",
                     person_detection_frame_step=1,
-                    preview_callback_sample_interval=2,
-                    max_results=8,
+                    preview_callback_sample_interval=3,
+                    max_results=6,
                     on_progress=on_progress,
                 )
                 deep_matches, first_match = _enrich_deep_matches(deep_report, deep_start=source_clip_start_offset)
@@ -3452,7 +4477,7 @@ def track_person_in_next_camera(
                         else:
                             raise
 
-                secondary_clip_path = ensure_openable_clip(
+                secondary_clip_path = ensure_analysis_clip(
                     Path(clip_result["final_local_path"]),
                     output_dir=downloads_dir,
                 )

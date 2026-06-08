@@ -97,6 +97,37 @@ Este es el flujo de vigilancia continua orientado a reglas simples.
   - parte de reglas simples
   - construye un repositorio de eventos e imagenes
 
+## Modo 3: Impact / Interaction Search
+
+Este es el flujo para investigar un objeto fijo seleccionado por el operador,
+por ejemplo un vehiculo estacionado junto a un dumpster.
+
+### Entrada
+
+- NVR/camara
+- rango historico
+- ROI normalizada marcada por el usuario
+- tipo de interaccion, por defecto `possible_vehicle_impact`
+
+### API principal
+
+- `POST /api/investigation/roi-interaction-search`
+- `GET /api/investigation/jobs/{job_id}`
+
+### Que hace
+
+1. Descarga microclips historicos por chunks desde el NVR.
+2. Analiza solo la ROI expandida para reducir costo.
+3. Busca cambios/movimiento y objetos cercanos como vehiculos o personas.
+4. Guarda candidatos con frame anotado, clip corto, timestamp y razon.
+5. Devuelve eventos para revision humana, no una conclusion legal automatica.
+
+### Casos de uso
+
+- "Quien golpeo el vehiculo estacionado?"
+- "Que movimiento hubo alrededor de este carro?"
+- "Alguien interactuo con este objeto fijo?"
+
 ## Relacion con el backend Java
 
 Los dos modos dependen del backend Java como fuente de verdad para:

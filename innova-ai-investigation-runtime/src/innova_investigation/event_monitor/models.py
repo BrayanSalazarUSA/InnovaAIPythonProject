@@ -52,6 +52,7 @@ class MonitorConfig(BaseModel):
     yolo_model: str = "yolo11n.pt"
     sample_every_seconds: float = 0.25
     max_runtime_seconds: float | None = None
+    auto_restart: bool = False
     enable_tracking: bool = True
     save_once_per_track: bool = True
     tracker_type: str = "botsort.yaml"

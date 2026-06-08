@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: innova-ai-investigation-runtime
+Version: 0.1.0
+Summary: Unified Python runtime for CCTV AI investigation workflows over Hikvision and Dahua NVRs.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: numpy<3,>=2.0
+Requires-Dist: opencv-python-headless<5,>=4.10
+Requires-Dist: pydantic<3,>=2.8
+Requires-Dist: python-multipart<1,>=0.0.9
+Requires-Dist: requests<3,>=2.32
+Requires-Dist: supervision<0.30,>=0.28
+Requires-Dist: ultralytics<9,>=8.3
+Requires-Dist: uvicorn[standard]<1,>=0.30
+
 # Innova AI Investigation Runtime
 
 Proyecto Python unificado para investigación CCTV con Hikvision y Dahua. Este runtime consolida el motor visual del proyecto `03`, el API operativo que hoy consume el frontend React desde `04`, y las utilidades de health checks de `05`, todo en una sola carpeta lista para mantener y desplegar.

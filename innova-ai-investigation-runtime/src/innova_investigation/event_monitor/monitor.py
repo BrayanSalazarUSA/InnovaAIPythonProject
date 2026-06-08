@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Callable
@@ -16,6 +19,81 @@ from .storage import EventStorage
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
+
+
+class _FfmpegFrameReader:
+    """Decode live streams through ffmpeg instead of OpenCV.
+
+    OpenCV's FFmpeg wrapper is noisy and brittle with some HEVC/H.265 NVR
+    streams. The live-view path already relies on ffmpeg/HLS, so this reader
+    keeps the monitor closer to the path that operators know works.
+    """
+
+    width = 960
+    height = 540
+
+    def __init__(self, source: str, *, sample_every_seconds: float) -> None:
+        self.source = source
+        self.sample_every_seconds = max(0.1, float(sample_every_seconds or 0.25))
+        self.proc: subprocess.Popen | None = None
+        self.frame_size = self.width * self.height * 3
+
+    def open(self) -> bool:
+        if not shutil.which("ffmpeg"):
+            return False
+        fps = min(8.0, max(0.2, 1.0 / self.sample_every_seconds))
+        vf = (
+            f"fps={fps},"
+            f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
+            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ]
+        if self.source.lower().startswith("rtsp://"):
+            command.extend(["-rtsp_transport", "tcp", "-timeout", "15000000"])
+        command.extend([
+            "-i",
+            self.source,
+            "-an",
+            "-vf",
+            vf,
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        self.proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self.frame_size * 2,
+        )
+        return True
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        if not self.proc or not self.proc.stdout:
+            return False, None
+        raw = self.proc.stdout.read(self.frame_size)
+        if len(raw) != self.frame_size:
+            return False, None
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return True, frame.copy()
+
+    def release(self) -> None:
+        if not self.proc:
+            return
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
 
 
 def load_monitor_config(path: str | Path) -> MonitorConfig:
@@ -66,17 +144,40 @@ class EventMonitor:
         self._stop_requested = True
 
     def run(self) -> dict[str, object]:
-        capture = cv2.VideoCapture(self.config.source)
-        if not capture.isOpened():
-            # If the source is a relative local video, resolve it from project root.
-            local_source = resolve_path(self.config.source, base_dir=self.project_root)
-            capture = cv2.VideoCapture(str(local_source))
-        if not capture.isOpened():
-            raise RuntimeError(f"No pude abrir el stream/video: {self.config.source}")
+        source_lower = self.config.source.lower()
+        source_is_rtsp = source_lower.startswith("rtsp://")
+        source_is_live_stream = source_is_rtsp or source_lower.startswith("http://") or source_lower.startswith("https://") or ".m3u8" in source_lower
+        capture = None
+        ffmpeg_reader = None
+        if source_is_live_stream:
+            ffmpeg_reader = _FfmpegFrameReader(
+                self.config.source,
+                sample_every_seconds=float(self.config.sample_every_seconds),
+            )
+            if not ffmpeg_reader.open():
+                ffmpeg_reader = None
 
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if ffmpeg_reader is None:
+            previous_capture_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+            if source_is_rtsp:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "rtsp_transport;tcp|stimeout;15000000|max_delay;500000|fflags;nobuffer"
+                )
+            capture = cv2.VideoCapture(self.config.source, cv2.CAP_FFMPEG)
+            if not capture.isOpened():
+                # If the source is a relative local video, resolve it from project root.
+                local_source = resolve_path(self.config.source, base_dir=self.project_root)
+                capture = cv2.VideoCapture(str(local_source), cv2.CAP_FFMPEG)
+            if previous_capture_options is None:
+                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+            else:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = previous_capture_options
+            if not capture.isOpened():
+                raise RuntimeError(f"No pude abrir el stream/video: {self.config.source}")
+
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) if capture is not None else 0.0
         if fps <= 0:
-            # RTSP streams often do not report FPS reliably. We still sample by wall clock.
+            # RTSP streams often do not report FPS reliably. We sample by wall clock below.
             fps = 15.0
 
         sample_every = max(0.1, float(self.config.sample_every_seconds))
@@ -96,12 +197,15 @@ class EventMonitor:
 
         try:
             while not self._stop_requested:
-                ok, frame = capture.read()
+                if ffmpeg_reader is not None:
+                    ok, frame = ffmpeg_reader.read()
+                else:
+                    ok, frame = capture.read()
                 if not ok or frame is None:
                     break
 
                 frame_index += 1
-                video_seconds = frame_index / fps if fps else time.monotonic() - started_monotonic
+                video_seconds = time.monotonic() - started_monotonic if ffmpeg_reader is not None else frame_index / fps
                 runtime_seconds = time.monotonic() - started_monotonic
                 if self.config.max_runtime_seconds and runtime_seconds >= self.config.max_runtime_seconds:
                     break
@@ -215,7 +319,16 @@ class EventMonitor:
                         }
                     )
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
+            if ffmpeg_reader is not None:
+                ffmpeg_reader.release()
+
+        if sampled_frames <= 0:
+            raise RuntimeError(
+                "El stream abrió, pero no entregó frames decodificables. "
+                "Probable causa: RTSP/HEVC inestable, codec H.265 corrupto o timeout de red."
+            )
 
         summary = {
             "ok": True,

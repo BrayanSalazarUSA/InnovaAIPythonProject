@@ -205,6 +205,7 @@ def _start_job_thread(
             "outputDir": config.output_dir,
             "sampleEverySeconds": config.sample_every_seconds,
             "maxRuntimeSeconds": config.max_runtime_seconds,
+            "autoRestart": config.auto_restart,
             "ruleNames": [rule.name for rule in config.rules],
             "ruleTypes": [rule.type for rule in config.rules],
         },
@@ -313,7 +314,7 @@ def list_monitor_jobs() -> dict[str, object]:
 @app.post("/api/event-monitor/jobs")
 def start_monitor_job(config: MonitorConfig, background: BackgroundTasks) -> dict[str, str]:
     _ = background
-    job = _start_job_thread(config)
+    job = _start_job_thread(config, auto_restart=bool(config.auto_restart))
     return {"jobId": job.job_id}
 
 
@@ -340,16 +341,71 @@ def stop_monitor_job(job_id: str) -> dict[str, object]:
     return {"ok": True, "jobId": job_id}
 
 
+def _split_camera_filters(*values: str | None) -> set[str]:
+    filters: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        for part in str(value).split(","):
+            normalized = _normalize_camera_key(part)
+            if normalized:
+                filters.add(normalized)
+    return filters
+
+
+def _normalize_camera_key(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _item_camera_keys(item: dict[str, object]) -> set[str]:
+    nested_event = item.get("event") if isinstance(item.get("event"), dict) else {}
+    keys = {
+        _normalize_camera_key(item.get("camera_id")),
+        _normalize_camera_key(item.get("cameraId")),
+        _normalize_camera_key(item.get("camera_name")),
+        _normalize_camera_key(item.get("cameraName")),
+        _normalize_camera_key(nested_event.get("camera_id")),
+        _normalize_camera_key(nested_event.get("cameraId")),
+        _normalize_camera_key(nested_event.get("camera_name")),
+        _normalize_camera_key(nested_event.get("cameraName")),
+    }
+    return {key for key in keys if key}
+
+
+def _filter_by_camera(items: list[dict[str, object]], camera_filters: set[str]) -> list[dict[str, object]]:
+    if not camera_filters:
+        return items
+    return [item for item in items if _item_camera_keys(item) & camera_filters]
+
+
 @app.get("/api/event-monitor/events")
-def list_events(outputDir: str = "output/event_monitor", limit: int = 100) -> dict[str, object]:
+def list_events(
+    outputDir: str = "output/event_monitor",
+    limit: int = 100,
+    cameraId: str | None = None,
+    cameraIds: str | None = None,
+) -> dict[str, object]:
     output_dir = resolve_path(outputDir, base_dir=runtime_config.PROJECT_ROOT)
-    return {"events": load_recent_events(output_dir, limit=max(1, min(limit, 500)))}
+    camera_filters = _split_camera_filters(cameraId, cameraIds)
+    response_limit = max(1, min(limit, 500))
+    read_limit = 2000 if camera_filters else response_limit
+    events = load_recent_events(output_dir, limit=read_limit)
+    return {"events": _filter_by_camera(events, camera_filters)[:response_limit]}
 
 
 @app.get("/api/event-monitor/objects")
-def list_objects(outputDir: str = "output/event_monitor", limit: int = 100) -> dict[str, object]:
+def list_objects(
+    outputDir: str = "output/event_monitor",
+    limit: int = 100,
+    cameraId: str | None = None,
+    cameraIds: str | None = None,
+) -> dict[str, object]:
     output_dir = resolve_path(outputDir, base_dir=runtime_config.PROJECT_ROOT)
-    return {"objects": load_recent_objects(output_dir, limit=max(1, min(limit, 500)))}
+    camera_filters = _split_camera_filters(cameraId, cameraIds)
+    response_limit = max(1, min(limit, 500))
+    read_limit = 2000 if camera_filters else response_limit
+    objects = load_recent_objects(output_dir, limit=read_limit)
+    return {"objects": _filter_by_camera(objects, camera_filters)[:response_limit]}
 
 
 @app.get("/api/event-monitor/artifact")

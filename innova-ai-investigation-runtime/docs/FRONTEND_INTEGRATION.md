@@ -23,6 +23,37 @@ entonces el frontend puede usar:
 VITE_INVESTIGATION_MVP_URL=http://localhost:8512/api
 ```
 
+Y si también quieres que el modo 2 apunte al mismo runtime:
+
+```env
+VITE_EVENT_MONITOR_URL=http://localhost:8512/api
+```
+
+## Dos formas de trabajo recomendadas
+
+### 1. Frontend local + runtime local
+
+```env
+VITE_INVESTIGATION_MVP_URL=http://127.0.0.1:8512/api
+VITE_EVENT_MONITOR_URL=http://127.0.0.1:8512/api
+```
+
+Luego inicia el runtime con:
+
+```bash
+bash scripts/run_api_with_profile.sh macos
+```
+
+### 2. Frontend local + runtime Ubuntu real
+
+```env
+VITE_INVESTIGATION_MVP_URL=http://18.234.252.123/investigation-api
+VITE_EVENT_MONITOR_URL=http://18.234.252.123/investigation-api
+```
+
+Esto es útil cuando quieres iterar la UI en `localhost`, pero seguir usando el
+bridge, SDKs y runtime reales del servidor Ubuntu.
+
 Con eso seguirá pegándole a:
 
 - `/investigation/first-appearance`

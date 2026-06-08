@@ -1,0 +1,6 @@
+[console_scripts]
+innova-dahua-health = innova_investigation.tools.dahua_health_check:main
+innova-event-monitor = innova_investigation.event_monitor.cli:main
+innova-event-monitor-api = innova_investigation.event_monitor.api:main
+innova-hikvision-health = innova_investigation.tools.hikvision_health_check:main
+innova-investigation-api = innova_investigation.__main__:main
