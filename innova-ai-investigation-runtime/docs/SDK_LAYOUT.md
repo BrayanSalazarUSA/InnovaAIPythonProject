@@ -9,6 +9,15 @@ En `vendor/sdk_archives/` quedaron copiados:
 
 Estos son los paquetes base para preparar el bridge Linux remoto.
 
+La adaptacion Python/ctypes de Hikvision vive en:
+
+- `src/innova_investigation/bridges/hikvision.py`
+- `src/innova_investigation/tools/hikvision_sdk_download.py`
+
+El primer archivo mantiene el bridge SSH que ejecuta HCNetSDK en Linux. El
+segundo expone el mismo runner como comando (`innova-hikvision-sdk-download`)
+para pruebas directas en Ubuntu, Docker o VM Linux.
+
 ## Recursos operativos
 
 - `resources/nvr_profiles.local.json`: perfiles locales de NVR.

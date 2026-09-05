@@ -69,6 +69,8 @@ Valores Linux recomendados:
 - `INNOVA_REMOTE_BRIDGE_HOST=127.0.0.1`
 - `INNOVA_REMOTE_BRIDGE_USER=ubuntu`
 - `INNOVA_HIKVISION_REMOTE_SDK_DIR=/opt/innova/hikvision/current/lib`
+- `INNOVA_HIKVISION_LOCAL_SDK_DIR=/opt/innova/hikvision/current/lib`
+- `INNOVA_HIKVISION_DOWNLOAD_MODE=local`
 - `INNOVA_DAHUA_REMOTE_SDK_DIR=/opt/innova/dahua`
 - `INNOVA_YOLO_MODEL_PATH=/opt/innova/investigation/yolo11n.pt`
 
@@ -94,7 +96,31 @@ export $(grep -v '^#' .env | xargs)
 python -m innova_investigation
 ```
 
-## 7. Systemd
+## 7. Probar el runner Hikvision/HCNetSDK
+
+La adaptacion Python del HCNetSDK tambien se puede ejecutar directo en Linux
+para validar que el SDK, las librerias y las credenciales estan bien antes de
+usar el API:
+
+```bash
+source .venv/bin/activate
+export HIK_SDK_ROOT=/opt/innova/hikvision/current/lib
+export HIK_EVIDENCE_ROOT=/tmp/innova_hikvision
+export HIK_HOST=<nvr-host>
+export HIK_SDK_PORT=8000
+export HIK_USER=<usuario>
+export HIK_PASSWORD=<password>
+export HIK_CHANNEL=1
+export HIK_START_ISO="2026-09-03 08:05:00"
+export HIK_END_ISO="2026-09-03 08:05:20"
+export HIK_OUTPUT_NAME="test_hikvision.mp4"
+innova-hikvision-sdk-download
+```
+
+La salida correcta es JSON con `ok: true`, `remote_path`, `sdk_channel` y
+`size_bytes`.
+
+## 8. Systemd
 
 Copia `deployment/systemd/innova-ai-investigation.service` a `/etc/systemd/system/`.
 

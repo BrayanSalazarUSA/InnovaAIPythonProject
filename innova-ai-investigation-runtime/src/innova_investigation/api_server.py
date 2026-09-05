@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 import base64
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import os
@@ -24,6 +27,7 @@ from .bridges.dahua import (
     DahuaBridgeSettings,
     DahuaRemoteBridgeSettings,
     download_clip_via_bridge_dahua,
+    download_clip_via_sdk,
     fetch_snapshot_bytes_via_http,
     fetch_snapshot_bytes_via_rtsp as fetch_dahua_snapshot_bytes_via_rtsp,
     find_dahua_sdk_root,
@@ -32,6 +36,7 @@ from .bridges.dahua import (
 from .bridges.hikvision import (
     HikvisionBridgeSettings,
     download_clip_via_bridge,
+    download_clip_via_local_sdk,
     fetch_snapshot_bytes_via_isapi,
     fetch_snapshot_bytes_via_rtsp as fetch_hikvision_snapshot_bytes_via_rtsp,
     list_channels_with_status_via_isapi,
@@ -82,6 +87,16 @@ BROWSER_TRANSCODE_MAX_BYTES = max(
     1,
     int(float(os.getenv("INNOVA_BROWSER_TRANSCODE_MAX_MB", "80") or 80) * 1024 * 1024),
 )
+DEEP_PERSON_DETECTION_FRAME_STEP = max(
+    1,
+    int(float(os.getenv("INNOVA_DEEP_PERSON_DETECTION_FRAME_STEP", "3") or 3)),
+)
+DEEP_SAVE_ANNOTATED_VIDEO = str(os.getenv("INNOVA_DEEP_SAVE_ANNOTATED_VIDEO", "0")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _parse_iso_dt(value: str) -> datetime:
@@ -252,6 +267,7 @@ class JobState:
     cancel_requested: bool = False
     base_url: str = ""
     job_dir: Path = field(default_factory=Path)
+    performance: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         payload = {
@@ -271,6 +287,8 @@ class JobState:
             payload["partialResult"] = self.partial_result
         if self.status == "done" and self.result is not None:
             payload["result"] = self.result
+        if self.performance:
+            payload["performance"] = self.performance
         return payload
 
 
@@ -282,6 +300,59 @@ PERSON_DETECTOR: Any | None = None
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+def _persist_job_state(job: JobState) -> None:
+    if not job.job_dir:
+        return
+    try:
+        job.job_dir.mkdir(parents=True, exist_ok=True)
+        with (job.job_dir / "job_state.json").open("w", encoding="utf-8") as file:
+            json.dump(job.to_payload(), file, indent=2, ensure_ascii=False)
+        if job.performance:
+            with (job.job_dir / "performance.json").open("w", encoding="utf-8") as file:
+                json.dump(job.performance, file, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _record_job_metric(job_id: str, phase: str, elapsed_seconds: float, **metadata: Any) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        phases = job.performance.setdefault("phases", {})
+        current = phases.setdefault(
+            phase,
+            {
+                "count": 0,
+                "totalSeconds": 0.0,
+                "lastSeconds": 0.0,
+                "maxSeconds": 0.0,
+                "samples": [],
+            },
+        )
+        elapsed = round(max(0.0, float(elapsed_seconds)), 3)
+        current["count"] = int(current.get("count", 0) or 0) + 1
+        current["totalSeconds"] = round(float(current.get("totalSeconds", 0.0) or 0.0) + elapsed, 3)
+        current["lastSeconds"] = elapsed
+        current["maxSeconds"] = round(max(float(current.get("maxSeconds", 0.0) or 0.0), elapsed), 3)
+        if metadata:
+            samples = current.setdefault("samples", [])
+            samples.append({"seconds": elapsed, **metadata})
+            current["samples"] = samples[-30:]
+        job.performance["updatedAt"] = _now_iso()
+        job.updated_at = job.performance["updatedAt"]
+        _persist_job_state(job)
+
+
+@contextmanager
+def _measure_job_phase(job_id: str, phase: str, **metadata: Any):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _record_job_metric(job_id, phase, time.perf_counter() - started, **metadata)
 
 
 def _update_job(job_id: str, *, stage: str | None = None, detail: str | None = None, progress: float | None = None) -> None:
@@ -296,6 +367,7 @@ def _update_job(job_id: str, *, stage: str | None = None, detail: str | None = N
         if progress is not None:
             job.progress = max(0.0, min(1.0, float(progress)))
         job.updated_at = _now_iso()
+        _persist_job_state(job)
 
 
 def _update_job_partial(job_id: str, partial_result: dict[str, Any]) -> None:
@@ -305,6 +377,7 @@ def _update_job_partial(job_id: str, partial_result: dict[str, Any]) -> None:
             return
         job.partial_result = partial_result
         job.updated_at = _now_iso()
+        _persist_job_state(job)
 
 
 def _job_cancel_requested(job_id: str) -> bool:
@@ -422,16 +495,16 @@ def _build_report_artifacts(job: JobState, result: dict[str, Any]) -> dict[str, 
     deep = result.get("deep")
     if isinstance(deep, dict):
         analysis_video_urls: list[str] = []
-        for url_key in ["annotated_video_url", "video_url"]:
+        for url_key in ["annotated_video_url"]:
             _append_unique_url(analysis_video_urls, str(deep.get(url_key) or ""))
-        for path_key in ["annotated_video_path", "video_path"]:
+        for path_key in ["annotated_video_path"]:
             _append_unique_url(analysis_video_urls, _artifact_url_for_openable_video_path(job, deep.get(path_key)))
         if analysis_video_urls:
             artifacts["object_analysis_video_url"] = analysis_video_urls[0]
             artifacts["object_analysis_video_urls"] = analysis_video_urls
 
         matches = deep.get("matches") or []
-        if isinstance(matches, list):
+        if isinstance(matches, list) and not artifacts.get("object_moment_clip_url"):
             clip_urls: list[str] = []
             for match in matches:
                 if not isinstance(match, dict):
@@ -494,9 +567,11 @@ def _build_report_artifacts(job: JobState, result: dict[str, Any]) -> dict[str, 
 
 
 def _rewrite_paths_to_urls(job: JobState, payload: dict[str, Any]) -> dict[str, Any]:
-    def convert_hit(hit: dict[str, Any]) -> dict[str, Any]:
+    def convert_hit(hit: dict[str, Any], *, include_clip: bool = True) -> dict[str, Any]:
         updated = dict(hit)
         for key in ["crop_path", "annotated_frame_path", "clip_path"]:
+            if key == "clip_path" and not include_clip:
+                continue
             path = str(updated.get(key, "") or "").strip()
             if not path:
                 continue
@@ -622,10 +697,16 @@ def _rewrite_paths_to_urls(job: JobState, payload: dict[str, Any]) -> dict[str, 
     deep = result.get("deep")
     if isinstance(deep, dict):
         deep2 = dict(deep)
+        deep2.pop("video_path", None)
         matches = deep2.get("matches") or []
         if isinstance(matches, list):
-            deep2["matches"] = [convert_people(convert_hit(item)) for item in matches if isinstance(item, dict)]
-        for key in ["annotated_video_path", "video_path"]:
+            deep2["matches"] = [
+                convert_people(convert_hit(item, include_clip=False)) for item in matches if isinstance(item, dict)
+            ]
+        deep_first_match = deep2.get("first_match")
+        if isinstance(deep_first_match, dict):
+            deep2["first_match"] = convert_people(convert_hit(deep_first_match, include_clip=False))
+        for key in ["annotated_video_path"]:
             path = str(deep2.get(key, "") or "").strip()
             if not path:
                 continue
@@ -717,8 +798,52 @@ def _enrich_deep_matches(deep_report: dict[str, Any], *, deep_start: float) -> t
 
     if not enriched:
         return [], None
-    first_match = min(enriched, key=lambda item: float(item.get("absolute_seconds", 0.0)))
+
+    def match_time(item: dict[str, Any]) -> float:
+        return float(item.get("absolute_seconds", 0.0) or 0.0)
+
+    def match_score(item: dict[str, Any]) -> float:
+        return float(item.get("score", 0.0) or 0.0)
+
+    def nearby_people(item: dict[str, Any]) -> int:
+        return int(item.get("nearby_person_count", item.get("nearbyPersonCount", 0)) or 0)
+
+    def visible_people(item: dict[str, Any]) -> int:
+        return int(item.get("person_count", item.get("personCount", 0)) or 0)
+
+    nearby_matches = [item for item in enriched if nearby_people(item) > 0]
+    visible_matches = [item for item in enriched if visible_people(item) > 0]
+    preferred_pool = nearby_matches or visible_matches or enriched
+    first_match = min(preferred_pool, key=lambda item: (match_time(item), -match_score(item)))
     return enriched, first_match
+
+
+def _build_object_moment_clip_payload(
+    *,
+    deep_segment_path: Path,
+    window_start_seconds: float,
+    window_end_seconds: float,
+    first_match: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(first_match, dict):
+        clip_path = str(first_match.get("clip_path") or "").strip()
+        if clip_path and Path(clip_path).exists():
+            absolute_seconds = float(
+                first_match.get("absolute_seconds", first_match.get("timestamp_seconds", window_start_seconds)) or 0.0
+            )
+            return {
+                "path": clip_path,
+                "start_seconds": round(max(0.0, absolute_seconds - runtime_config.EVIDENCE_CLIP_SECONDS_BEFORE), 2),
+                "end_seconds": round(absolute_seconds + runtime_config.EVIDENCE_CLIP_SECONDS_AFTER, 2),
+                "source": "best_match_clip",
+            }
+
+    return {
+        "path": str(deep_segment_path),
+        "start_seconds": round(float(window_start_seconds), 2),
+        "end_seconds": round(float(window_end_seconds), 2),
+        "source": "deep_window",
+    }
 
 
 def _pick_hit_from_result(
@@ -1252,10 +1377,32 @@ def _build_investigation_bridge(vendor: str, downloads_dir: Path) -> HikvisionBr
     )
 
 
-def _download_investigation_clip(
+def _should_use_local_dahua_sdk() -> bool:
+    return runtime_config.DAHUA_DOWNLOAD_MODE in {"auto", "local", "mac", "macos"}
+
+
+def _should_use_remote_dahua_bridge() -> bool:
+    return runtime_config.DAHUA_DOWNLOAD_MODE in {"auto", "remote", "bridge", "ssh"}
+
+
+def _should_use_local_hikvision_sdk() -> bool:
+    mode = runtime_config.HIKVISION_DOWNLOAD_MODE
+    if mode in {"local", "direct", "linux"}:
+        return True
+    if mode == "auto":
+        return sys.platform.startswith("linux")
+    return False
+
+
+def _should_use_remote_hikvision_bridge() -> bool:
+    mode = runtime_config.HIKVISION_DOWNLOAD_MODE
+    if mode in {"auto", "remote", "bridge", "ssh"}:
+        return True
+    return False
+
+
+def _download_dahua_clip_local(
     *,
-    vendor: str,
-    bridge: HikvisionBridgeSettings | DahuaRemoteBridgeSettings,
     host: str,
     sdk_port: int,
     username: str,
@@ -1266,25 +1413,65 @@ def _download_investigation_clip(
     local_target_dir: Path,
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
-    if vendor == "hikvision":
-        return download_clip_via_bridge(
-            bridge=bridge,  # type: ignore[arg-type]
+    settings = DahuaBridgeSettings(sdk_root=find_dahua_sdk_root())
+    primary_channel = max(0, int(logical_channel) - 1)
+    try:
+        if progress_callback is not None:
+            progress_callback(
+                "local_dahua_sdk",
+                f"Descargando clip Dahua localmente con NetSDK Java Mac canal {primary_channel}.",
+            )
+        return download_clip_via_sdk(
+            settings=settings,
             host=host,
             sdk_port=int(sdk_port),
             username=username,
             password=password,
-            logical_channel=int(logical_channel),
+            channel=primary_channel,
             start_dt=start_dt,
             end_dt=end_dt,
             local_target_dir=local_target_dir,
-            normalize_for_review=False,
-            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "2147483650" not in msg and "0x80000002" not in msg:
+            raise
+        fallback_channel = int(logical_channel)
+        if progress_callback is not None:
+            progress_callback(
+                "local_dahua_sdk",
+                f"Reintentando Dahua local con canal alterno {fallback_channel} (mapeo 1-based).",
+            )
+        return download_clip_via_sdk(
+            settings=settings,
+            host=host,
+            sdk_port=int(sdk_port),
+            username=username,
+            password=password,
+            channel=fallback_channel,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            local_target_dir=local_target_dir,
         )
 
+
+def _download_dahua_clip_remote(
+    *,
+    bridge: DahuaRemoteBridgeSettings,
+    host: str,
+    sdk_port: int,
+    username: str,
+    password: str,
+    logical_channel: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    local_target_dir: Path,
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
     primary_channel = max(0, int(logical_channel) - 1)
     try:
         return download_clip_via_bridge_dahua(
-            bridge=bridge,  # type: ignore[arg-type]
+            bridge=bridge,
             host=host,
             sdk_port=int(sdk_port),
             username=username,
@@ -1306,7 +1493,7 @@ def _download_investigation_clip(
                 f"Reintentando Dahua NetSDK con canal alterno {fallback_channel} (mapeo 1-based).",
             )
         return download_clip_via_bridge_dahua(
-            bridge=bridge,  # type: ignore[arg-type]
+            bridge=bridge,
             host=host,
             sdk_port=int(sdk_port),
             username=username,
@@ -1317,6 +1504,154 @@ def _download_investigation_clip(
             local_target_dir=local_target_dir,
             progress_callback=progress_callback,
         )
+
+
+def _download_dahua_investigation_clip(
+    *,
+    bridge: DahuaRemoteBridgeSettings | None,
+    host: str,
+    sdk_port: int,
+    username: str,
+    password: str,
+    logical_channel: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    local_target_dir: Path,
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    local_error: Exception | None = None
+    if _should_use_local_dahua_sdk():
+        try:
+            return _download_dahua_clip_local(
+                host=host,
+                sdk_port=sdk_port,
+                username=username,
+                password=password,
+                logical_channel=logical_channel,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                local_target_dir=local_target_dir,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            local_error = exc
+            if runtime_config.DAHUA_DOWNLOAD_MODE in {"local", "mac", "macos"}:
+                raise
+            if progress_callback is not None:
+                progress_callback(
+                    "local_dahua_sdk",
+                    f"Dahua local no disponible ({exc}). Intentando bridge remoto.",
+                )
+
+    if _should_use_remote_dahua_bridge() and bridge is not None:
+        try:
+            return _download_dahua_clip_remote(
+                bridge=bridge,
+                host=host,
+                sdk_port=sdk_port,
+                username=username,
+                password=password,
+                logical_channel=logical_channel,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                local_target_dir=local_target_dir,
+                progress_callback=progress_callback,
+            )
+        except Exception:
+            if local_error is not None:
+                raise RuntimeError(
+                    f"Dahua local falló ({local_error}) y el bridge remoto también falló."
+                ) from local_error
+            raise
+
+    if local_error is not None:
+        raise RuntimeError(f"Dahua local falló y el bridge remoto está deshabilitado: {local_error}") from local_error
+    raise RuntimeError(
+        "Modo Dahua inválido. Usa INNOVA_DAHUA_DOWNLOAD_MODE=auto, local o remote."
+    )
+
+
+def _download_investigation_clip(
+    *,
+    vendor: str,
+    bridge: HikvisionBridgeSettings | DahuaRemoteBridgeSettings,
+    host: str,
+    sdk_port: int,
+    username: str,
+    password: str,
+    logical_channel: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    local_target_dir: Path,
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    if vendor == "hikvision":
+        local_error: Exception | None = None
+        if _should_use_local_hikvision_sdk():
+            try:
+                return download_clip_via_local_sdk(
+                    host=host,
+                    sdk_port=int(sdk_port),
+                    username=username,
+                    password=password,
+                    logical_channel=int(logical_channel),
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    local_target_dir=local_target_dir,
+                    sdk_root=runtime_config.HIKVISION_LOCAL_SDK_DIR,
+                    normalize_for_review=False,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                local_error = exc
+                if runtime_config.HIKVISION_DOWNLOAD_MODE in {"local", "direct", "linux"}:
+                    raise
+                if progress_callback is not None:
+                    progress_callback(
+                        "local_hikvision_sdk",
+                        f"Hikvision local no disponible ({exc}). Intentando bridge remoto.",
+                    )
+
+        if _should_use_remote_hikvision_bridge():
+            try:
+                return download_clip_via_bridge(
+                    bridge=bridge,  # type: ignore[arg-type]
+                    host=host,
+                    sdk_port=int(sdk_port),
+                    username=username,
+                    password=password,
+                    logical_channel=int(logical_channel),
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    local_target_dir=local_target_dir,
+                    normalize_for_review=False,
+                    progress_callback=progress_callback,
+                )
+            except Exception:
+                if local_error is not None:
+                    raise RuntimeError(
+                        f"Hikvision local fallo ({local_error}) y el bridge remoto tambien fallo."
+                    ) from local_error
+                raise
+
+        if local_error is not None:
+            raise RuntimeError(f"Hikvision local fallo y el bridge remoto esta deshabilitado: {local_error}") from local_error
+        raise RuntimeError(
+            "Modo Hikvision invalido. Usa INNOVA_HIKVISION_DOWNLOAD_MODE=auto, local o remote."
+        )
+
+    return _download_dahua_investigation_clip(
+        bridge=bridge if isinstance(bridge, DahuaRemoteBridgeSettings) else None,
+        host=host,
+        sdk_port=sdk_port,
+        username=username,
+        password=password,
+        logical_channel=logical_channel,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        local_target_dir=local_target_dir,
+        progress_callback=progress_callback,
+    )
 
 
 def _collect_person_reference_paths(
@@ -2767,6 +3102,7 @@ async def start_roi_interaction_search(
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
+        _persist_job_state(job)
 
     def runner() -> None:
         events: list[dict[str, Any]] = []
@@ -2967,6 +3303,7 @@ async def start_roi_interaction_search(
                     job2.result = result_payload
                     job2.partial_result = None
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
         except Exception as exc:
             with JOBS_LOCK:
                 job2 = JOBS.get(job_id)
@@ -2976,6 +3313,7 @@ async def start_roi_interaction_search(
                     job2.detail = "ROI interaction search falló."
                     job2.error = str(exc)
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
 
     background.add_task(runner)
     return {"ok": True, "jobId": job_id, "status": "running"}
@@ -3099,8 +3437,10 @@ async def start_static_object_discovery(
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
+        _persist_job_state(job)
 
     def runner() -> None:
+        runner_started = time.perf_counter()
         try:
             with ENGINE_LOCK:
                 discovery_dir = job_dir / "static_discovery"
@@ -3155,37 +3495,51 @@ async def start_static_object_discovery(
                         f"Check {check_index}: {label} en {_dt_to_payload(center_dt)}",
                         ratio,
                     )
-                    clip_result = _download_investigation_clip(
-                        vendor=normalized_vendor,
-                        bridge=bridge,
-                        host=resolved_host,
-                        sdk_port=resolved_sdk_port,
-                        username=resolved_user,
-                        password=resolved_pass,
-                        logical_channel=int(logicalChannel),
-                        start_dt=probe_start,
-                        end_dt=probe_end,
-                        local_target_dir=check_downloads_dir,
-                        progress_callback=lambda s, d: _update_job(job_id, stage=s, detail=d),
-                    )
+                    with _measure_job_phase(
+                        job_id,
+                        "static_probe_download",
+                        label=label,
+                        channel=int(logicalChannel),
+                        requestedSeconds=round(probe_seconds, 2),
+                    ):
+                        clip_result = _download_investigation_clip(
+                            vendor=normalized_vendor,
+                            bridge=bridge,
+                            host=resolved_host,
+                            sdk_port=resolved_sdk_port,
+                            username=resolved_user,
+                            password=resolved_pass,
+                            logical_channel=int(logicalChannel),
+                            start_dt=probe_start,
+                            end_dt=probe_end,
+                            local_target_dir=check_downloads_dir,
+                            progress_callback=lambda s, d: _update_job(job_id, stage=s, detail=d),
+                        )
                     clip_path = ensure_openable_clip(
                         Path(clip_result["final_local_path"]),
                         output_dir=check_downloads_dir,
                     )
-                    probe = probe_static_object_clip(
-                        query_path=query_path,
-                        video_path=clip_path,
-                        output_dir=check_dir,
-                        similarity_threshold=float(similarityThreshold or 0.58),
-                        stage_label="static_probe",
-                        sample_count=representative_frame_count,
-                        roi=normalized_roi,
-                        baseline_roi_path=baseline_roi_path,
-                        baseline_similarity_score=baseline_similarity_score,
-                        change_threshold=0.14,
-                        combined_threshold=0.52,
-                        require_change=bool(normalized_roi and baseline_roi_path is not None),
-                    )
+                    with _measure_job_phase(
+                        job_id,
+                        "static_probe_analysis",
+                        label=label,
+                        representativeFrames=representative_frame_count,
+                        hasRoi=bool(normalized_roi),
+                    ):
+                        probe = probe_static_object_clip(
+                            query_path=query_path,
+                            video_path=clip_path,
+                            output_dir=check_dir,
+                            similarity_threshold=float(similarityThreshold or 0.58),
+                            stage_label="static_probe",
+                            sample_count=representative_frame_count,
+                            roi=normalized_roi,
+                            baseline_roi_path=baseline_roi_path,
+                            baseline_similarity_score=baseline_similarity_score,
+                            change_threshold=0.14,
+                            combined_threshold=0.52,
+                            require_change=bool(normalized_roi and baseline_roi_path is not None),
+                        )
                     if normalized_roi and baseline_roi_path is None:
                         roi_reference = str(probe.get("roi_reference_path") or "").strip()
                         if roi_reference:
@@ -3563,6 +3917,13 @@ async def start_static_object_discovery(
                         json.dump(result_payload, file, indent=2, ensure_ascii=False)
                 except Exception:
                     pass
+                _record_job_metric(
+                    job_id,
+                    "static_discovery_total",
+                    time.perf_counter() - runner_started,
+                    status="done",
+                    checks=len(checks),
+                )
                 with JOBS_LOCK:
                     job2 = JOBS.get(job_id)
                     if not job2:
@@ -3573,7 +3934,14 @@ async def start_static_object_discovery(
                     job2.progress = 1.0
                     job2.result = result_payload
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
         except Exception as exc:
+            _record_job_metric(
+                job_id,
+                "static_discovery_total",
+                time.perf_counter() - runner_started,
+                status="error",
+            )
             with JOBS_LOCK:
                 job2 = JOBS.get(job_id)
                 if job2:
@@ -3583,6 +3951,7 @@ async def start_static_object_discovery(
                     job2.error = str(exc)
                     job2.progress = min(float(job2.progress or 0.0), 0.99)
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
 
     background.add_task(runner)
     return {"jobId": job_id}
@@ -3710,6 +4079,7 @@ async def start_first_appearance(
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
+        _persist_job_state(job)
 
     def runner() -> None:
         # The runner needs the query path inside the job directory; we pass it through the job_dir.
@@ -3772,46 +4142,18 @@ async def start_first_appearance(
                         remote_python=runtime_config.REMOTE_BRIDGE_PYTHON,
                         remote_sdk_dir=runtime_config.DAHUA_REMOTE_SDK_DIR,
                     )
-                    # Dahua puede variar en indexado de canales (algunas instalaciones usan 1-based).
-                    # Intentamos 0-based (logical-1) y si el SDK responde "invalid param" reintentamos 1-based.
-                    primary_channel = max(0, int(logicalChannel) - 1)
-                    try:
-                        clip_result = download_clip_via_bridge_dahua(
-                            bridge=bridge,
-                            host=resolved_host,
-                            sdk_port=int(resolved_sdk_port),
-                            username=resolved_user,
-                            password=resolved_pass,
-                            sdk_channel=primary_channel,
-                            start_dt=start_dt,
-                            end_dt=end_dt,
-                            local_target_dir=downloads_dir,
-                            progress_callback=lambda s, d: on_progress(s, d, 0.5),
-                        )
-                    except Exception as exc:
-                        msg = str(exc)
-                        # 2147483650 == 0x80000002 suele mapear a "invalid param".
-                        if "2147483650" in msg or "0x80000002" in msg:
-                            fallback_channel = int(logicalChannel)
-                            on_progress(
-                                "server_download",
-                                f"Reintentando Dahua NetSDK con canal alterno {fallback_channel} (mapeo 1-based)…",
-                                0.6,
-                            )
-                            clip_result = download_clip_via_bridge_dahua(
-                                bridge=bridge,
-                                host=resolved_host,
-                                sdk_port=int(resolved_sdk_port),
-                                username=resolved_user,
-                                password=resolved_pass,
-                                sdk_channel=fallback_channel,
-                                start_dt=start_dt,
-                                end_dt=end_dt,
-                                local_target_dir=downloads_dir,
-                                progress_callback=lambda s, d: on_progress(s, d, 0.75),
-                            )
-                        else:
-                            raise
+                    clip_result = _download_dahua_investigation_clip(
+                        bridge=bridge,
+                        host=resolved_host,
+                        sdk_port=int(resolved_sdk_port),
+                        username=resolved_user,
+                        password=resolved_pass,
+                        logical_channel=int(logicalChannel),
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        local_target_dir=downloads_dir,
+                        progress_callback=lambda s, d: on_progress(s, d, 0.5),
+                    )
 
                 clip_path = Path(clip_result["final_local_path"])
                 on_progress("normalize", "Preparando clip para análisis local...", 0.15)
@@ -3888,19 +4230,26 @@ async def start_first_appearance(
                         similarity_threshold=float(similarityThreshold),
                         frame_step=2,
                         person_trigger_mode="always",
-                        person_detection_frame_step=1,
+                        person_detection_frame_step=DEEP_PERSON_DETECTION_FRAME_STEP,
                         preview_callback_sample_interval=3,
                         max_results=6,
+                        save_annotated_video=DEEP_SAVE_ANNOTATED_VIDEO,
+                        early_stop_on_person_match=True,
                         on_progress=on_progress,
                     )
-                    _, first_match = _enrich_deep_matches(deep_report, deep_start=deep_start)
+                    deep_matches, first_match = _enrich_deep_matches(deep_report, deep_start=deep_start)
+                    if deep_matches:
+                        deep_report["matches"] = deep_matches
+                    if first_match:
+                        deep_report["first_match"] = first_match
                     result_payload["deep"] = deep_report
                     result_payload["first_match"] = first_match or {}
-                    result_payload["object_moment_clip"] = {
-                        "path": str(deep_segment_path),
-                        "start_seconds": round(float(deep_start), 2),
-                        "end_seconds": round(float(deep_end), 2),
-                    }
+                    result_payload["object_moment_clip"] = _build_object_moment_clip_payload(
+                        deep_segment_path=deep_segment_path,
+                        window_start_seconds=deep_start,
+                        window_end_seconds=deep_end,
+                        first_match=first_match,
+                    )
 
                 result_payload = _rewrite_paths_to_urls(job, result_payload)
 
@@ -3914,6 +4263,7 @@ async def start_first_appearance(
                     job2.progress = 1.0
                     job2.result = result_payload
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
         except Exception as exc:
             with JOBS_LOCK:
                 job2 = JOBS.get(job_id)
@@ -3924,6 +4274,7 @@ async def start_first_appearance(
                     job2.error = str(exc)
                     job2.progress = min(float(job2.progress or 0.0), 0.99)
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
 
     background.add_task(runner)
     return {"jobId": job_id}
@@ -4011,6 +4362,7 @@ def start_deep_search(
         job.updated_at = _now_iso()
 
     def runner() -> None:
+        runner_started = time.perf_counter()
         try:
             with ENGINE_LOCK:
                 deep_dir = job_dir / "deep"
@@ -4154,19 +4506,25 @@ def start_deep_search(
                         )
                         bridge = _build_investigation_bridge(resolved_vendor, downloads_dir)
                         on_progress("deep_prepare", "Descargando ventana alrededor del abandono para asociar persona...", 0.08)
-                        clip_result = _download_investigation_clip(
-                            vendor=resolved_vendor,
-                            bridge=bridge,
-                            host=resolved_host,
-                            sdk_port=resolved_sdk_port,
-                            username=resolved_username,
-                            password=resolved_password,
-                            logical_channel=resolved_logical_channel,
-                            start_dt=window_start_dt,
-                            end_dt=window_end_dt,
-                            local_target_dir=downloads_dir,
-                            progress_callback=lambda stage, detail: _update_job(job_id, stage=stage, detail=detail),
-                        )
+                        with _measure_job_phase(
+                            job_id,
+                            "deep_source_download",
+                            channel=resolved_logical_channel,
+                            requestedSeconds=round((window_end_dt - window_start_dt).total_seconds(), 2),
+                        ):
+                            clip_result = _download_investigation_clip(
+                                vendor=resolved_vendor,
+                                bridge=bridge,
+                                host=resolved_host,
+                                sdk_port=resolved_sdk_port,
+                                username=resolved_username,
+                                password=resolved_password,
+                                logical_channel=resolved_logical_channel,
+                                start_dt=window_start_dt,
+                                end_dt=window_end_dt,
+                                local_target_dir=downloads_dir,
+                                progress_callback=lambda stage, detail: _update_job(job_id, stage=stage, detail=detail),
+                            )
                         source_clip_path = _prefer_native_clip_variant(Path(clip_result["final_local_path"]))
 
                     source_clip_start_offset = max(0.0, float(window_start_offset or 0.0))
@@ -4221,12 +4579,18 @@ def start_deep_search(
                     if source_window_end_offset > 0:
                         source_clip_end_offset = min(source_clip_end_offset, source_window_end_offset)
                     on_progress("deep_prepare", "Extrayendo clip exacto alrededor del objeto confirmado...", 0.08)
-                    deep_segment_path = extract_video_segment(
-                        source_video=source_clip_path,
-                        output_video=deep_dir / "deep_segment.mp4",
-                        start_seconds=deep_start_relative,
-                        end_seconds=deep_end_relative,
-                    )
+                    with _measure_job_phase(
+                        job_id,
+                        "deep_segment_extract",
+                        requestedSeconds=round(deep_end_relative - deep_start_relative, 2),
+                        mode=source_analysis_mode,
+                    ):
+                        deep_segment_path = extract_video_segment(
+                            source_video=source_clip_path,
+                            output_video=deep_dir / "deep_segment.mp4",
+                            start_seconds=deep_start_relative,
+                            end_seconds=deep_end_relative,
+                        )
                 else:
                     duration_seconds = float(clip.get("duration_seconds", 0.0) or 0.0)
                     radius = float(payload.investigationRadius or 25.0)
@@ -4237,28 +4601,44 @@ def start_deep_search(
                     source_clip_start_offset = deep_start
                     source_clip_end_offset = deep_end
                     on_progress("deep_prepare", "Extrayendo ventana profunda alrededor del hallazgo confirmado...", 0.08)
-                    deep_segment_path = extract_video_segment(
-                        source_video=source_clip_path,
-                        output_video=deep_dir / "deep_segment.mp4",
-                        start_seconds=deep_start,
-                        end_seconds=deep_end,
-                    )
+                    with _measure_job_phase(
+                        job_id,
+                        "deep_segment_extract",
+                        requestedSeconds=round(deep_end - deep_start, 2),
+                        mode=source_analysis_mode,
+                    ):
+                        deep_segment_path = extract_video_segment(
+                            source_video=source_clip_path,
+                            output_video=deep_dir / "deep_segment.mp4",
+                            start_seconds=deep_start,
+                            end_seconds=deep_end,
+                        )
 
-                deep_report = run_deep_analysis(
-                    query_path=query_path,
-                    video_path=deep_segment_path,
-                    output_dir=deep_dir / "analysis",
-                    similarity_threshold=float(payload.similarityThreshold or 0.58),
-                    frame_step=2,
-                    person_trigger_mode="always",
-                    person_detection_frame_step=1,
-                    preview_callback_sample_interval=3,
-                    max_results=6,
-                    on_progress=on_progress,
-                )
+                with _measure_job_phase(
+                    job_id,
+                    "deep_analysis",
+                    frameStep=2,
+                    personFrameStep=DEEP_PERSON_DETECTION_FRAME_STEP,
+                ):
+                    deep_report = run_deep_analysis(
+                        query_path=query_path,
+                        video_path=deep_segment_path,
+                        output_dir=deep_dir / "analysis",
+                        similarity_threshold=float(payload.similarityThreshold or 0.58),
+                        frame_step=2,
+                        person_trigger_mode="always",
+                        person_detection_frame_step=DEEP_PERSON_DETECTION_FRAME_STEP,
+                        preview_callback_sample_interval=3,
+                        max_results=6,
+                        save_annotated_video=DEEP_SAVE_ANNOTATED_VIDEO,
+                        early_stop_on_person_match=True,
+                        on_progress=on_progress,
+                    )
                 deep_matches, first_match = _enrich_deep_matches(deep_report, deep_start=source_clip_start_offset)
                 if deep_matches:
                     deep_report["matches"] = deep_matches
+                if first_match:
+                    deep_report["first_match"] = first_match
 
                 next_payload = dict(result_payload)
                 next_payload["mode"] = "guided_pipeline"
@@ -4268,12 +4648,20 @@ def start_deep_search(
                 next_payload["first_match"] = first_match or {}
                 next_payload["deep_window_start"] = source_clip_start_offset
                 next_payload["deep_window_end"] = source_clip_end_offset
-                next_payload["object_moment_clip"] = {
-                    "path": str(deep_segment_path),
-                    "start_seconds": round(float(source_clip_start_offset), 2),
-                    "end_seconds": round(float(source_clip_end_offset), 2),
-                }
+                next_payload["object_moment_clip"] = _build_object_moment_clip_payload(
+                    deep_segment_path=deep_segment_path,
+                    window_start_seconds=source_clip_start_offset,
+                    window_end_seconds=source_clip_end_offset,
+                    first_match=first_match,
+                )
                 next_payload = _rewrite_paths_to_urls(job, next_payload)
+                _record_job_metric(
+                    job_id,
+                    "deep_search_total",
+                    time.perf_counter() - runner_started,
+                    status="done",
+                    matches=len(deep_matches or []),
+                )
 
                 with JOBS_LOCK:
                     job2 = JOBS.get(job_id)
@@ -4285,7 +4673,14 @@ def start_deep_search(
                     job2.progress = 1.0
                     job2.result = next_payload
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
         except Exception as exc:
+            _record_job_metric(
+                job_id,
+                "deep_search_total",
+                time.perf_counter() - runner_started,
+                status="error",
+            )
             with JOBS_LOCK:
                 job2 = JOBS.get(job_id)
                 if job2:
@@ -4295,6 +4690,7 @@ def start_deep_search(
                     job2.error = str(exc)
                     job2.progress = min(float(job2.progress or 0.0), 0.99)
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
 
     background.add_task(runner)
     return {"jobId": job_id}
@@ -4371,6 +4767,7 @@ def track_person_in_next_camera(
         job.updated_at = _now_iso()
 
     def runner() -> None:
+        runner_started = time.perf_counter()
         try:
             with ENGINE_LOCK:
                 track_dir = job_dir / "related_person"
@@ -4410,72 +4807,54 @@ def track_person_in_next_camera(
                     progress=0.83,
                 )
 
-                if normalized_vendor == "hikvision":
-                    bridge = HikvisionBridgeSettings(
-                        ssh_host=runtime_config.REMOTE_BRIDGE_HOST,
-                        ssh_user=runtime_config.REMOTE_BRIDGE_USER,
-                        ssh_key_path=runtime_config.SSH_KEY_PATH,
-                        remote_python=runtime_config.REMOTE_BRIDGE_PYTHON,
-                        local_download_dir=downloads_dir,
-                    )
-                    clip_result = download_clip_via_bridge(
-                        bridge=bridge,
-                        host=str(payload.host).strip(),
-                        sdk_port=int(payload.sdkPort),
-                        username=resolved_user,
-                        password=resolved_pass,
-                        logical_channel=int(payload.logicalChannel),
-                        start_dt=start_dt,
-                        end_dt=end_dt,
-                        local_target_dir=downloads_dir,
-                        normalize_for_review=False,
-                        progress_callback=lambda s, d: on_progress(s, d, 0.6),
-                    )
-                else:
-                    bridge = DahuaRemoteBridgeSettings(
-                        ssh_host=runtime_config.REMOTE_BRIDGE_HOST,
-                        ssh_user=runtime_config.REMOTE_BRIDGE_USER,
-                        ssh_key_path=runtime_config.SSH_KEY_PATH,
-                        remote_python=runtime_config.REMOTE_BRIDGE_PYTHON,
-                        remote_sdk_dir=runtime_config.DAHUA_REMOTE_SDK_DIR,
-                    )
-                    primary_channel = max(0, int(payload.logicalChannel) - 1)
-                    try:
-                        clip_result = download_clip_via_bridge_dahua(
+                with _measure_job_phase(
+                    job_id,
+                    "track_source_download",
+                    vendor=normalized_vendor,
+                    channel=int(payload.logicalChannel),
+                    requestedSeconds=round((end_dt - start_dt).total_seconds(), 2),
+                ):
+                    if normalized_vendor == "hikvision":
+                        bridge = HikvisionBridgeSettings(
+                            ssh_host=runtime_config.REMOTE_BRIDGE_HOST,
+                            ssh_user=runtime_config.REMOTE_BRIDGE_USER,
+                            ssh_key_path=runtime_config.SSH_KEY_PATH,
+                            remote_python=runtime_config.REMOTE_BRIDGE_PYTHON,
+                            local_download_dir=downloads_dir,
+                        )
+                        clip_result = download_clip_via_bridge(
                             bridge=bridge,
                             host=str(payload.host).strip(),
                             sdk_port=int(payload.sdkPort),
                             username=resolved_user,
                             password=resolved_pass,
-                            sdk_channel=primary_channel,
+                            logical_channel=int(payload.logicalChannel),
+                            start_dt=start_dt,
+                            end_dt=end_dt,
+                            local_target_dir=downloads_dir,
+                            normalize_for_review=False,
+                            progress_callback=lambda s, d: on_progress(s, d, 0.6),
+                        )
+                    else:
+                        bridge = DahuaRemoteBridgeSettings(
+                            ssh_host=runtime_config.REMOTE_BRIDGE_HOST,
+                            ssh_user=runtime_config.REMOTE_BRIDGE_USER,
+                            ssh_key_path=runtime_config.SSH_KEY_PATH,
+                            remote_python=runtime_config.REMOTE_BRIDGE_PYTHON,
+                            remote_sdk_dir=runtime_config.DAHUA_REMOTE_SDK_DIR,
+                        )
+                        clip_result = _download_dahua_investigation_clip(
+                            bridge=bridge,
+                            host=str(payload.host).strip(),
+                            sdk_port=int(payload.sdkPort),
+                            username=resolved_user,
+                            password=resolved_pass,
+                            logical_channel=int(payload.logicalChannel),
                             start_dt=start_dt,
                             end_dt=end_dt,
                             local_target_dir=downloads_dir,
                             progress_callback=lambda s, d: on_progress(s, d, 0.6),
                         )
-                    except Exception as exc:
-                        msg = str(exc)
-                        if "2147483650" in msg or "0x80000002" in msg:
-                            fallback_channel = int(payload.logicalChannel)
-                            on_progress(
-                                "server_download",
-                                f"Reintentando Dahua NetSDK con canal alterno {fallback_channel}…",
-                                0.75,
-                            )
-                            clip_result = download_clip_via_bridge_dahua(
-                                bridge=bridge,
-                                host=str(payload.host).strip(),
-                                sdk_port=int(payload.sdkPort),
-                                username=resolved_user,
-                                password=resolved_pass,
-                                sdk_channel=fallback_channel,
-                                start_dt=start_dt,
-                                end_dt=end_dt,
-                                local_target_dir=downloads_dir,
-                                progress_callback=lambda s, d: on_progress(s, d, 0.85),
-                            )
-                        else:
-                            raise
 
                 secondary_clip_path = ensure_analysis_clip(
                     Path(clip_result["final_local_path"]),
@@ -4483,27 +4862,29 @@ def track_person_in_next_camera(
                 )
 
                 if discovery_only or not copied_ref_paths:
-                    coarse_report = _scan_clip_for_person_candidates(
-                        video_path=secondary_clip_path,
-                        output_dir=scans_dir / "coarse_person_discovery",
-                        sample_every_seconds=max(0.35, float(payload.coarseStepSeconds or 2.0)),
-                        stage_label="person_track_coarse",
-                        keep_top=16,
-                        time_offset_seconds=0.0,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_coarse_scan", mode="discovery"):
+                        coarse_report = _scan_clip_for_person_candidates(
+                            video_path=secondary_clip_path,
+                            output_dir=scans_dir / "coarse_person_discovery",
+                            sample_every_seconds=max(0.35, float(payload.coarseStepSeconds or 2.0)),
+                            stage_label="person_track_coarse",
+                            keep_top=16,
+                            time_offset_seconds=0.0,
+                            on_progress=on_progress,
+                        )
                 else:
-                    coarse_report = _scan_clip_for_person_references(
-                        reference_paths=copied_ref_paths,
-                        video_path=secondary_clip_path,
-                        output_dir=scans_dir / "coarse_person",
-                        sample_every_seconds=float(payload.coarseStepSeconds or 2.0),
-                        similarity_threshold=max(0.28, float(payload.similarityThreshold or 0.45) - 0.08),
-                        stage_label="person_track_coarse",
-                        keep_top=12,
-                        time_offset_seconds=0.0,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_coarse_scan", mode="reference", references=len(copied_ref_paths)):
+                        coarse_report = _scan_clip_for_person_references(
+                            reference_paths=copied_ref_paths,
+                            video_path=secondary_clip_path,
+                            output_dir=scans_dir / "coarse_person",
+                            sample_every_seconds=float(payload.coarseStepSeconds or 2.0),
+                            similarity_threshold=max(0.28, float(payload.similarityThreshold or 0.45) - 0.08),
+                            stage_label="person_track_coarse",
+                            keep_top=12,
+                            time_offset_seconds=0.0,
+                            on_progress=on_progress,
+                        )
                 coarse_candidates = coarse_report.get("top_hits") or []
                 if not isinstance(coarse_candidates, list) or not coarse_candidates:
                     raise RuntimeError(
@@ -4531,35 +4912,42 @@ def track_person_in_next_camera(
                 if refine_end <= refine_start:
                     refine_end = refine_start + max(5.0, refine_radius)
 
-                refine_segment_path = extract_video_segment(
-                    source_video=secondary_clip_path,
-                    output_video=scans_dir / "refine_segment.mp4",
-                    start_seconds=refine_start,
-                    end_seconds=refine_end,
-                )
+                with _measure_job_phase(
+                    job_id,
+                    "track_refine_segment_extract",
+                    requestedSeconds=round(refine_end - refine_start, 2),
+                ):
+                    refine_segment_path = extract_video_segment(
+                        source_video=secondary_clip_path,
+                        output_video=scans_dir / "refine_segment.mp4",
+                        start_seconds=refine_start,
+                        end_seconds=refine_end,
+                    )
 
                 if discovery_only or not copied_ref_paths:
-                    refine_report = _scan_clip_for_person_candidates(
-                        video_path=refine_segment_path,
-                        output_dir=scans_dir / "refine_person_discovery",
-                        sample_every_seconds=max(0.25, float(payload.refineStepSeconds or 1.0)),
-                        stage_label="person_track_refine",
-                        keep_top=16,
-                        time_offset_seconds=refine_start,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_refine_scan", mode="discovery"):
+                        refine_report = _scan_clip_for_person_candidates(
+                            video_path=refine_segment_path,
+                            output_dir=scans_dir / "refine_person_discovery",
+                            sample_every_seconds=max(0.25, float(payload.refineStepSeconds or 1.0)),
+                            stage_label="person_track_refine",
+                            keep_top=16,
+                            time_offset_seconds=refine_start,
+                            on_progress=on_progress,
+                        )
                 else:
-                    refine_report = _scan_clip_for_person_references(
-                        reference_paths=copied_ref_paths,
-                        video_path=refine_segment_path,
-                        output_dir=scans_dir / "refine_person",
-                        sample_every_seconds=max(0.35, float(payload.refineStepSeconds or 1.0)),
-                        similarity_threshold=max(0.25, float(payload.similarityThreshold or 0.45) - 0.10),
-                        stage_label="person_track_refine",
-                        keep_top=12,
-                        time_offset_seconds=refine_start,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_refine_scan", mode="reference", references=len(copied_ref_paths)):
+                        refine_report = _scan_clip_for_person_references(
+                            reference_paths=copied_ref_paths,
+                            video_path=refine_segment_path,
+                            output_dir=scans_dir / "refine_person",
+                            sample_every_seconds=max(0.35, float(payload.refineStepSeconds or 1.0)),
+                            similarity_threshold=max(0.25, float(payload.similarityThreshold or 0.45) - 0.10),
+                            stage_label="person_track_refine",
+                            keep_top=12,
+                            time_offset_seconds=refine_start,
+                            on_progress=on_progress,
+                        )
 
                 refined_first = (
                     refine_report.get("earliest_hit")
@@ -4576,35 +4964,42 @@ def track_person_in_next_camera(
                 if deep_end <= deep_start:
                     deep_end = deep_start + max(5.0, deep_radius)
 
-                deep_segment_path = extract_video_segment(
-                    source_video=secondary_clip_path,
-                    output_video=deep_dir / "deep_segment.mp4",
-                    start_seconds=deep_start,
-                    end_seconds=deep_end,
-                )
+                with _measure_job_phase(
+                    job_id,
+                    "track_deep_segment_extract",
+                    requestedSeconds=round(deep_end - deep_start, 2),
+                ):
+                    deep_segment_path = extract_video_segment(
+                        source_video=secondary_clip_path,
+                        output_video=deep_dir / "deep_segment.mp4",
+                        start_seconds=deep_start,
+                        end_seconds=deep_end,
+                    )
 
                 if discovery_only or not copied_ref_paths:
-                    deep_report = _scan_clip_for_person_candidates(
-                        video_path=deep_segment_path,
-                        output_dir=deep_dir / "person_analysis_discovery",
-                        sample_every_seconds=0.25,
-                        stage_label="person_track_deep",
-                        keep_top=20,
-                        time_offset_seconds=deep_start,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_deep_scan", mode="discovery"):
+                        deep_report = _scan_clip_for_person_candidates(
+                            video_path=deep_segment_path,
+                            output_dir=deep_dir / "person_analysis_discovery",
+                            sample_every_seconds=0.25,
+                            stage_label="person_track_deep",
+                            keep_top=20,
+                            time_offset_seconds=deep_start,
+                            on_progress=on_progress,
+                        )
                 else:
-                    deep_report = _scan_clip_for_person_references(
-                        reference_paths=copied_ref_paths,
-                        video_path=deep_segment_path,
-                        output_dir=deep_dir / "person_analysis",
-                        sample_every_seconds=0.35,
-                        similarity_threshold=max(0.24, float(payload.similarityThreshold or 0.45) - 0.12),
-                        stage_label="person_track_deep",
-                        keep_top=16,
-                        time_offset_seconds=deep_start,
-                        on_progress=on_progress,
-                    )
+                    with _measure_job_phase(job_id, "track_deep_scan", mode="reference", references=len(copied_ref_paths)):
+                        deep_report = _scan_clip_for_person_references(
+                            reference_paths=copied_ref_paths,
+                            video_path=deep_segment_path,
+                            output_dir=deep_dir / "person_analysis",
+                            sample_every_seconds=0.35,
+                            similarity_threshold=max(0.24, float(payload.similarityThreshold or 0.45) - 0.12),
+                            stage_label="person_track_deep",
+                            keep_top=16,
+                            time_offset_seconds=deep_start,
+                            on_progress=on_progress,
+                        )
                 deep_report["matches"] = deep_report.get("top_hits") or []
                 deep_first = (
                     deep_report.get("earliest_hit")
@@ -4650,6 +5045,13 @@ def track_person_in_next_camera(
                 next_payload = dict(result_payload)
                 next_payload["person_track"] = track_payload
                 next_payload = _rewrite_paths_to_urls(job, next_payload)
+                _record_job_metric(
+                    job_id,
+                    "track_person_total",
+                    time.perf_counter() - runner_started,
+                    status="done",
+                    candidates=len(deep_report.get("matches") or []),
+                )
 
                 with JOBS_LOCK:
                     job2 = JOBS.get(job_id)
@@ -4661,7 +5063,14 @@ def track_person_in_next_camera(
                     job2.progress = 1.0
                     job2.result = next_payload
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
         except Exception as exc:
+            _record_job_metric(
+                job_id,
+                "track_person_total",
+                time.perf_counter() - runner_started,
+                status="error",
+            )
             with JOBS_LOCK:
                 job2 = JOBS.get(job_id)
                 if job2:
@@ -4671,6 +5080,7 @@ def track_person_in_next_camera(
                     job2.error = str(exc)
                     job2.progress = min(float(job2.progress or 0.0), 0.99)
                     job2.updated_at = _now_iso()
+                    _persist_job_state(job2)
 
     background.add_task(runner)
     return {"jobId": job_id}

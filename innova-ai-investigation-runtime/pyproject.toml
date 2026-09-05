@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 innova-investigation-api = "innova_investigation.__main__:main"
 innova-hikvision-health = "innova_investigation.tools.hikvision_health_check:main"
+innova-hikvision-sdk-download = "innova_investigation.tools.hikvision_sdk_download:main"
 innova-dahua-health = "innova_investigation.tools.dahua_health_check:main"
 innova-event-monitor = "innova_investigation.event_monitor.cli:main"
 innova-event-monitor-api = "innova_investigation.event_monitor.api:main"

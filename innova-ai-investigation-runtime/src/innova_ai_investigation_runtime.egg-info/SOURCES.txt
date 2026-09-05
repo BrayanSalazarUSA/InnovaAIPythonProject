@@ -30,3 +30,4 @@ src/innova_investigation/event_monitor/tracking.py
 src/innova_investigation/tools/__init__.py
 src/innova_investigation/tools/dahua_health_check.py
 src/innova_investigation/tools/hikvision_health_check.py
+src/innova_investigation/tools/hikvision_sdk_download.py

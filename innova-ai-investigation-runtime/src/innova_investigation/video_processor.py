@@ -170,6 +170,8 @@ class VideoProcessor:
         processed_frames = 0
         frame_index = -1
         interrupted_by_user = False
+        stopped_after_confident_person_match = False
+        early_stop_after_frame: int | None = None
         last_detection_summary = "Buscando coincidencias visuales..."
         last_detection_timestamp = "-"
         last_detection_score = 0.0
@@ -245,6 +247,23 @@ class VideoProcessor:
 
                 current_visual_matches = new_visual_matches
 
+                if config.EARLY_STOP_ON_PERSON_MATCH:
+                    confident_threshold = max(
+                        float(config.EARLY_STOP_MIN_MATCH_SCORE),
+                        float(config.SIMILARITY_THRESHOLD),
+                    )
+                    has_confident_person_match = any(
+                        match.nearby_person_count > 0 and match.score >= confident_threshold
+                        for match in new_visual_matches
+                    )
+                    if has_confident_person_match and timestamp_seconds >= config.EARLY_STOP_MIN_SECONDS:
+                        patience_frames = max(1, int(round(config.EARLY_STOP_PATIENCE_SECONDS * max(fps, 1.0))))
+                        candidate_stop_frame = frame_index + patience_frames
+                        if early_stop_after_frame is None:
+                            early_stop_after_frame = candidate_stop_frame
+                        else:
+                            early_stop_after_frame = min(early_stop_after_frame, candidate_stop_frame)
+
                 if new_visual_matches:
                     strongest_match = max(new_visual_matches, key=lambda match: match.score)
                     last_detection_summary = f"Objeto similar detectado | score {strongest_match.score:.3f}"
@@ -271,26 +290,28 @@ class VideoProcessor:
                         flush=True,
                     )
 
-            preview_frame = self._render_preview(
-                frame=frame,
-                current_matches=current_visual_matches,
-                tracked_people=current_tracked_people,
-                best_matches=best_matches,
-                frame_index=frame_index,
-                processed_frames=processed_frames,
-                total_frames=total_frames,
-                fps=fps,
-                timestamp_seconds=timestamp_seconds,
-                is_sampled_frame=is_sampled_frame,
-                last_detection_summary=last_detection_summary,
-                last_detection_timestamp=last_detection_timestamp,
-                last_detection_score=last_detection_score,
-                person_detection_summary=person_detection_summary,
-                score_trace=score_trace,
-                zone_counter=zone_counter,
-            )
+            preview_frame: np.ndarray | None = None
+            if self.preview_enabled or config.SAVE_ANNOTATED_VIDEO or self.preview_callback is not None:
+                preview_frame = self._render_preview(
+                    frame=frame,
+                    current_matches=current_visual_matches,
+                    tracked_people=current_tracked_people,
+                    best_matches=best_matches,
+                    frame_index=frame_index,
+                    processed_frames=processed_frames,
+                    total_frames=total_frames,
+                    fps=fps,
+                    timestamp_seconds=timestamp_seconds,
+                    is_sampled_frame=is_sampled_frame,
+                    last_detection_summary=last_detection_summary,
+                    last_detection_timestamp=last_detection_timestamp,
+                    last_detection_score=last_detection_score,
+                    person_detection_summary=person_detection_summary,
+                    score_trace=score_trace,
+                    zone_counter=zone_counter,
+                )
+                self._write_preview_frame(preview_frame, fps)
 
-            self._write_preview_frame(preview_frame, fps)
             self._emit_runtime_update(
                 preview_frame=preview_frame,
                 frame_index=frame_index,
@@ -307,9 +328,17 @@ class VideoProcessor:
                 is_sampled_frame=is_sampled_frame,
             )
 
-            if self.preview_enabled and not self._show_preview(preview_frame):
+            if self.preview_enabled and preview_frame is not None and not self._show_preview(preview_frame):
                 interrupted_by_user = True
                 print("Analisis detenido por el usuario.", flush=True)
+                break
+
+            if early_stop_after_frame is not None and frame_index >= early_stop_after_frame:
+                stopped_after_confident_person_match = True
+                print(
+                    "Analisis detenido temprano: objeto y persona cercana confirmados.",
+                    flush=True,
+                )
                 break
 
         video_capture.release()
@@ -328,6 +357,7 @@ class VideoProcessor:
             fps=fps,
             total_seconds=total_seconds,
             interrupted_by_user=interrupted_by_user,
+            stopped_after_confident_person_match=stopped_after_confident_person_match,
             zone_counter=zone_counter,
         )
         self._write_reports(report)
@@ -794,6 +824,7 @@ class VideoProcessor:
         fps: float,
         total_seconds: float,
         interrupted_by_user: bool,
+        stopped_after_confident_person_match: bool,
         zone_counter: Counter[str],
     ) -> dict[str, object]:
         return {
@@ -809,6 +840,7 @@ class VideoProcessor:
                 "max_results": config.MAX_RESULTS,
                 "processing_max_width": config.PROCESSING_MAX_WIDTH,
                 "preview_max_width": config.PREVIEW_MAX_WIDTH,
+                "save_annotated_video": config.SAVE_ANNOTATED_VIDEO,
                 "zone_grid_rows": config.ZONE_GRID_ROWS,
                 "zone_grid_cols": config.ZONE_GRID_COLS,
                 "template_scales": list(config.TEMPLATE_SCALES),
@@ -816,6 +848,9 @@ class VideoProcessor:
                 "person_detection_trigger_mode": config.PERSON_DETECTION_TRIGGER_MODE,
                 "person_detection_frame_step": config.PERSON_DETECTION_FRAME_STEP,
                 "person_confidence_threshold": config.PERSON_CONFIDENCE_THRESHOLD,
+                "early_stop_on_person_match": config.EARLY_STOP_ON_PERSON_MATCH,
+                "early_stop_min_match_score": config.EARLY_STOP_MIN_MATCH_SCORE,
+                "early_stop_patience_seconds": config.EARLY_STOP_PATIENCE_SECONDS,
                 "yolo_model_path": str(config.YOLO_MODEL_PATH),
             },
             "person_tracking_summary": {
@@ -832,6 +867,7 @@ class VideoProcessor:
                 "fps": round(fps, 3),
                 "duration_seconds": round(total_seconds, 3),
                 "interrupted_by_user": interrupted_by_user,
+                "early_stop_triggered": stopped_after_confident_person_match,
             },
             "zone_summary": dict(zone_counter.most_common()),
             "matches_found": len(matches),
@@ -1448,7 +1484,7 @@ class VideoProcessor:
 
     def _emit_runtime_update(
         self,
-        preview_frame: np.ndarray,
+        preview_frame: np.ndarray | None,
         frame_index: int,
         total_frames: int,
         timestamp_seconds: float,
@@ -1482,7 +1518,7 @@ class VideoProcessor:
                 }
             )
 
-        if self.preview_callback is not None and (
+        if preview_frame is not None and self.preview_callback is not None and (
             (is_sampled_frame and processed_frames % config.PREVIEW_CALLBACK_SAMPLE_INTERVAL == 0)
             or frame_index == 0
             or bool(current_matches)

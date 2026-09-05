@@ -1153,6 +1153,8 @@ def run_deep_analysis(
     person_detection_frame_step: int,
     preview_callback_sample_interval: int,
     max_results: int,
+    save_annotated_video: bool = True,
+    early_stop_on_person_match: bool = False,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     def on_status(update: dict[str, Any]) -> None:
@@ -1173,7 +1175,7 @@ def run_deep_analysis(
         video_path=video_path,
         output_dir=output_dir,
         show_preview=False,
-        save_annotated_video=True,
+        save_annotated_video=save_annotated_video,
         frame_step=frame_step,
         similarity_threshold=similarity_threshold,
         max_results=max_results,
@@ -1181,6 +1183,7 @@ def run_deep_analysis(
         person_detection_trigger_mode=person_trigger_mode,
         person_detection_frame_step=person_detection_frame_step,
         preview_callback_sample_interval=preview_callback_sample_interval,
+        early_stop_on_person_match=early_stop_on_person_match,
     )
     return VideoProcessor(status_callback=on_status, preview_callback=None).run()
 

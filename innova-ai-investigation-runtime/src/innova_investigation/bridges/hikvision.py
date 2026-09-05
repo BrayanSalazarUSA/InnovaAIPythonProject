@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from urllib.parse import quote
 from xml.etree import ElementTree
 
 import cv2
+import numpy as np
 import requests
 from requests.auth import HTTPDigestAuth
 
@@ -833,6 +835,133 @@ def download_clip_via_bridge(
 
     return {
         "remote_path": payload["remote_path"],
+        "raw_local_path": str(local_raw_path),
+        "final_local_path": str(final_path),
+        "logical_channel": payload["logical_channel"],
+        "sdk_channel": payload["sdk_channel"],
+        "size_bytes": payload["size_bytes"],
+        "download_pos": payload["download_pos"],
+        "normalize_for_review": normalize_for_review,
+        "converted_to_standard_mp4": final_path == normalized_path,
+        "normalization_note": normalization_note,
+        "ffmpeg_stderr": ffmpeg_result.stderr.strip(),
+    }
+
+
+def download_clip_via_local_sdk(
+    *,
+    host: str,
+    sdk_port: int,
+    username: str,
+    password: str,
+    logical_channel: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    local_target_dir: Path,
+    sdk_root: str | None = None,
+    normalize_for_review: bool = True,
+    progress_callback=None,
+) -> dict[str, Any]:
+    local_target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp_label = start_dt.strftime("%Y%m%d_%H%M%S")
+    output_name = f"channel_{logical_channel:02d}_{timestamp_label}_{end_dt.strftime('%H%M%S')}.mp4"
+    local_raw_path = local_target_dir / output_name
+    if local_raw_path.exists():
+        local_raw_path.unlink()
+
+    _emit_progress(
+        progress_callback,
+        "local_hikvision_sdk",
+        f"Descargando Hikvision localmente con HCNetSDK canal {logical_channel}.",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "HIK_HOST": host,
+            "HIK_SDK_PORT": str(int(sdk_port)),
+            "HIK_USER": username,
+            "HIK_PASSWORD": password,
+            "HIK_CHANNEL": str(int(logical_channel)),
+            "HIK_START_ISO": start_dt.isoformat(sep=" "),
+            "HIK_END_ISO": end_dt.isoformat(sep=" "),
+            "HIK_OUTPUT_NAME": output_name,
+            "HIK_EVIDENCE_ROOT": str(local_target_dir),
+        }
+    )
+    resolved_sdk_root = (sdk_root or config.HIKVISION_LOCAL_SDK_DIR or "").strip()
+    if resolved_sdk_root:
+        env["HIK_SDK_ROOT"] = resolved_sdk_root
+
+    result = subprocess.run(
+        [sys.executable, "-m", "innova_investigation.tools.hikvision_sdk_download"],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Fallo descarga local Hikvision.")
+
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error", "HCNetSDK local no pudo descargar el clip."))
+
+    sdk_output_path = Path(payload["remote_path"])
+    if sdk_output_path != local_raw_path and sdk_output_path.exists():
+        shutil.copy2(sdk_output_path, local_raw_path)
+    if not local_raw_path.exists() or local_raw_path.stat().st_size <= 0:
+        raise RuntimeError("HCNetSDK local reporto OK, pero el archivo local no existe o esta vacio.")
+
+    final_path = local_raw_path
+    normalized_path = local_target_dir / f"{local_raw_path.stem}_standard.mp4"
+    ffmpeg_result = subprocess.CompletedProcess(args=[], returncode=127, stdout="", stderr="ffmpeg no disponible")
+    normalization_note = "Se conserva el clip crudo descargado desde Hikvision para analisis."
+    if normalize_for_review:
+        ffmpeg_binary = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+        normalization_note = "Se conserva el clip crudo descargado desde Hikvision."
+        if Path(ffmpeg_binary).exists():
+            _emit_progress(
+                progress_callback,
+                "normalize",
+                "Convirtiendo video a MP4 estandar con ffmpeg.",
+            )
+            ffmpeg_command = [
+                ffmpeg_binary,
+                "-y",
+                "-i",
+                str(local_raw_path),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(normalized_path),
+            ]
+            ffmpeg_result = _run_subprocess(ffmpeg_command)
+            if ffmpeg_result.returncode == 0 and normalized_path.exists():
+                final_path = normalized_path
+                normalization_note = "Normalizado con ffmpeg."
+        elif local_raw_path.exists():
+            _emit_progress(
+                progress_callback,
+                "normalize",
+                "Convirtiendo video a MP4 estandar con OpenCV.",
+            )
+            ok, note = _normalize_with_opencv(local_raw_path, normalized_path)
+            normalization_note = note
+            if ok:
+                final_path = normalized_path
+
+    _emit_progress(
+        progress_callback,
+        "done",
+        "Clip Hikvision listo para analizar.",
+    )
+
+    return {
+        "remote_path": str(sdk_output_path),
         "raw_local_path": str(local_raw_path),
         "final_local_path": str(final_path),
         "logical_channel": payload["logical_channel"],

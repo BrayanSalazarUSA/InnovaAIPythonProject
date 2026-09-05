@@ -43,6 +43,7 @@ DEFAULT_MAX_RESULTS = 20
 DEFAULT_ENABLE_PERSON_DETECTION = True
 DEFAULT_PERSON_DETECTION_FRAME_STEP = 2
 DEFAULT_PREVIEW_CALLBACK_SAMPLE_INTERVAL = 1
+DEFAULT_EARLY_STOP_ON_PERSON_MATCH = False
 FRAME_STEP = DEFAULT_FRAME_STEP
 SIMILARITY_THRESHOLD = DEFAULT_SIMILARITY_THRESHOLD
 MAX_RESULTS = DEFAULT_MAX_RESULTS
@@ -111,6 +112,10 @@ MAX_ASSOCIATED_PEOPLE_PER_MATCH = 4
 PERSON_NEAR_MATCH_BONUS = 0.14
 PERSON_VISIBLE_MATCH_BONUS = 0.05
 EARLY_MATCH_TIME_PENALTY_PER_SECOND = 0.002
+EARLY_STOP_ON_PERSON_MATCH = DEFAULT_EARLY_STOP_ON_PERSON_MATCH
+EARLY_STOP_MIN_MATCH_SCORE = float(os.getenv("INNOVA_EARLY_STOP_MIN_MATCH_SCORE", "0.52") or 0.52)
+EARLY_STOP_PATIENCE_SECONDS = float(os.getenv("INNOVA_EARLY_STOP_PATIENCE_SECONDS", "4.0") or 4.0)
+EARLY_STOP_MIN_SECONDS = float(os.getenv("INNOVA_EARLY_STOP_MIN_SECONDS", "2.0") or 2.0)
 
 BACKEND_API_BASE_URL = os.getenv("INNOVA_BACKEND_API_URL", "http://127.0.0.1:8080/api").rstrip("/")
 PUBLIC_API_BASE_URL = os.getenv("INNOVA_PUBLIC_API_BASE_URL", "").strip().rstrip("/")
@@ -123,7 +128,14 @@ HIKVISION_REMOTE_SDK_DIR = os.getenv(
     "INNOVA_HIKVISION_REMOTE_SDK_DIR",
     "/opt/innova/hikvision/current/lib",
 )
+HIKVISION_LOCAL_SDK_DIR = os.getenv(
+    "INNOVA_HIKVISION_LOCAL_SDK_DIR",
+    HIKVISION_REMOTE_SDK_DIR,
+).strip()
+HIKVISION_DOWNLOAD_MODE = os.getenv("INNOVA_HIKVISION_DOWNLOAD_MODE", "remote").strip().lower() or "remote"
 DAHUA_REMOTE_SDK_DIR = os.getenv("INNOVA_DAHUA_REMOTE_SDK_DIR", "/opt/innova/dahua")
+DAHUA_JAVA_SDK_ROOT = os.getenv("INNOVA_DAHUA_JAVA_SDK_ROOT", "").strip()
+DAHUA_DOWNLOAD_MODE = os.getenv("INNOVA_DAHUA_DOWNLOAD_MODE", "auto").strip().lower() or "auto"
 Dahua_LINUX_ARCHIVE = SDK_ARCHIVES_DIR / "General_NetSDK_Eng_Linux64_IS_V3.060.0000003.0.R.251127.tar.gz"
 HIKVISION_LINUX_ARCHIVE = SDK_ARCHIVES_DIR / "EN-HCNetSDKV6.1.9.4_build20220412_linux64.zip"
 
@@ -167,11 +179,13 @@ def apply_runtime_overrides(
     person_detection_trigger_mode: str | None = None,
     person_detection_frame_step: int | None = None,
     preview_callback_sample_interval: int | None = None,
+    early_stop_on_person_match: bool | None = None,
 ) -> None:
     global QUERY_IMAGE_PATH, VIDEO_PATH, OUTPUT_DIR
     global SHOW_PREVIEW, SAVE_ANNOTATED_VIDEO
     global FRAME_STEP, SIMILARITY_THRESHOLD, MAX_RESULTS, ENABLE_PERSON_DETECTION
     global PERSON_DETECTION_TRIGGER_MODE, PERSON_DETECTION_FRAME_STEP, PREVIEW_CALLBACK_SAMPLE_INTERVAL
+    global EARLY_STOP_ON_PERSON_MATCH
 
     if query_image_path is not None:
         QUERY_IMAGE_PATH = Path(query_image_path)
@@ -197,6 +211,8 @@ def apply_runtime_overrides(
         PERSON_DETECTION_FRAME_STEP = max(1, person_detection_frame_step)
     if preview_callback_sample_interval is not None:
         PREVIEW_CALLBACK_SAMPLE_INTERVAL = max(1, preview_callback_sample_interval)
+    if early_stop_on_person_match is not None:
+        EARLY_STOP_ON_PERSON_MATCH = bool(early_stop_on_person_match)
 
     _refresh_output_paths()
 
@@ -215,6 +231,7 @@ def reset_runtime_overrides() -> None:
         person_detection_trigger_mode="always",
         person_detection_frame_step=DEFAULT_PERSON_DETECTION_FRAME_STEP,
         preview_callback_sample_interval=DEFAULT_PREVIEW_CALLBACK_SAMPLE_INTERVAL,
+        early_stop_on_person_match=DEFAULT_EARLY_STOP_ON_PERSON_MATCH,
     )
 
 
