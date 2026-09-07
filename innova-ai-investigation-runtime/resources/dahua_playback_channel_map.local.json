@@ -1,0 +1,13 @@
+{
+  "mappings": [
+    {
+      "enabled": true,
+      "nvrId": "56",
+      "nvrName": "Palo Verde 2",
+      "host": "66.208.238.188",
+      "cameraName": "2-16_6204_DW1",
+      "logicalChannel": 1,
+      "sdkPlaybackChannel": 1
+    }
+  ]
+}

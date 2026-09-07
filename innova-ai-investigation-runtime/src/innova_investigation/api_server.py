@@ -67,6 +67,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 OUTPUT_ROOT = runtime_config.OUTPUT_DIR / "api_jobs"
 NVR_PROFILES_PATH = runtime_config.NVR_PROFILES_PATH
+DAHUA_PLAYBACK_CHANNEL_MAP_PATH = runtime_config.DAHUA_PLAYBACK_CHANNEL_MAP_PATH
 BACKEND_API_BASE_URL = runtime_config.BACKEND_API_BASE_URL
 VIDEO_ARTIFACT_EXTENSIONS = {".mp4", ".dav", ".avi", ".mov", ".mkv", ".264", ".h264"}
 STATIC_DISCOVERY_DEFAULT_MICROCLIP_SECONDS = 8.0
@@ -119,6 +120,94 @@ def _normalize_vendor(value: str) -> str:
     if raw.startswith("unv") or raw.startswith("uni") or "uniview" in raw or "uniarch" in raw:
         return "uniview"
     return raw or "hikvision"
+
+
+def _normalize_lookup_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _load_dahua_playback_channel_map() -> list[dict[str, Any]]:
+    try:
+        if not DAHUA_PLAYBACK_CHANNEL_MAP_PATH.exists():
+            return []
+        payload = json.loads(DAHUA_PLAYBACK_CHANNEL_MAP_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries = payload.get("mappings") if isinstance(payload, dict) else payload
+    return [entry for entry in entries or [] if isinstance(entry, dict)]
+
+
+def _resolve_dahua_playback_sdk_channel(
+    *,
+    host: str,
+    nvr_id: str | int | None,
+    nvr_name: str,
+    camera_id: str | int | None,
+    camera_name: str,
+    logical_channel: int,
+) -> tuple[int, dict[str, Any]]:
+    logical = max(1, int(logical_channel or 1))
+    default_sdk_channel = max(0, logical - 1)
+    target_host = _normalize_lookup_key(host)
+    target_nvr_id = _normalize_lookup_key(nvr_id)
+    target_nvr_name = _normalize_lookup_key(nvr_name)
+    target_camera_id = _normalize_lookup_key(camera_id)
+    target_camera_name = _normalize_lookup_key(camera_name)
+
+    for entry in _load_dahua_playback_channel_map():
+        if entry.get("enabled") is False:
+            continue
+        entry_host = _normalize_lookup_key(entry.get("host"))
+        entry_nvr_id = _normalize_lookup_key(entry.get("nvrId") or entry.get("nvr_id"))
+        entry_nvr_name = _normalize_lookup_key(entry.get("nvrName") or entry.get("nvr_name"))
+        entry_camera_id = _normalize_lookup_key(entry.get("cameraId") or entry.get("camera_id"))
+        entry_camera_name = _normalize_lookup_key(entry.get("cameraName") or entry.get("camera_name"))
+        entry_logical = int(entry.get("logicalChannel") or entry.get("logical_channel") or 0)
+
+        nvr_matches = (
+            bool(target_nvr_id and entry_nvr_id == target_nvr_id)
+            or bool(target_host and entry_host == target_host)
+            or bool(target_nvr_name and entry_nvr_name == target_nvr_name)
+        )
+        camera_matches = (
+            bool(target_camera_id and entry_camera_id == target_camera_id)
+            or bool(target_camera_name and entry_camera_name == target_camera_name)
+            or bool(entry_logical and entry_logical == logical)
+        )
+        if not (nvr_matches and camera_matches):
+            continue
+
+        raw_sdk_channel = (
+            entry.get("sdkPlaybackChannel")
+            if entry.get("sdkPlaybackChannel") is not None
+            else entry.get("sdk_channel")
+            if entry.get("sdk_channel") is not None
+            else entry.get("playbackChannel")
+        )
+        if raw_sdk_channel is None:
+            continue
+        sdk_channel = max(0, int(raw_sdk_channel))
+        return sdk_channel, {
+            "source": "dahua_playback_channel_map",
+            "mapPath": str(DAHUA_PLAYBACK_CHANNEL_MAP_PATH),
+            "logicalChannel": logical,
+            "sdkPlaybackChannel": sdk_channel,
+            "cameraId": str(camera_id or ""),
+            "cameraName": str(camera_name or ""),
+            "nvrId": str(nvr_id or ""),
+            "nvrName": str(nvr_name or ""),
+        }
+
+    return default_sdk_channel, {
+        "source": "default_zero_based",
+        "logicalChannel": logical,
+        "sdkPlaybackChannel": default_sdk_channel,
+        "cameraId": str(camera_id or ""),
+        "cameraName": str(camera_name or ""),
+        "nvrId": str(nvr_id or ""),
+        "nvrName": str(nvr_name or ""),
+    }
+
 
 def _load_nvr_profiles() -> list[dict[str, Any]]:
     try:
@@ -378,6 +467,23 @@ def _update_job_partial(job_id: str, partial_result: dict[str, Any]) -> None:
         job.partial_result = partial_result
         job.updated_at = _now_iso()
         _persist_job_state(job)
+
+
+def _make_live_preview_callback(output_path: Path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    last_write = {"at": 0.0}
+
+    def write_preview(frame: Any) -> None:
+        now = time.monotonic()
+        if now - last_write["at"] < 0.75:
+            return
+        try:
+            cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            last_write["at"] = now
+        except Exception:
+            pass
+
+    return write_preview
 
 
 def _job_cancel_requested(job_id: str) -> bool:
@@ -1411,17 +1517,20 @@ def _download_dahua_clip_local(
     start_dt: datetime,
     end_dt: datetime,
     local_target_dir: Path,
+    playback_sdk_channel: int | None = None,
+    channel_resolution: dict[str, Any] | None = None,
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     settings = DahuaBridgeSettings(sdk_root=find_dahua_sdk_root())
-    primary_channel = max(0, int(logical_channel) - 1)
+    primary_channel = max(0, int(playback_sdk_channel)) if playback_sdk_channel is not None else max(0, int(logical_channel) - 1)
     try:
         if progress_callback is not None:
+            resolution_source = str((channel_resolution or {}).get("source") or "default_zero_based")
             progress_callback(
                 "local_dahua_sdk",
-                f"Descargando clip Dahua localmente con NetSDK Java Mac canal {primary_channel}.",
+                f"Descargando clip Dahua localmente con NetSDK Java Mac canal SDK {primary_channel} ({resolution_source}).",
             )
-        return download_clip_via_sdk(
+        result = download_clip_via_sdk(
             settings=settings,
             host=host,
             sdk_port=int(sdk_port),
@@ -1432,6 +1541,8 @@ def _download_dahua_clip_local(
             end_dt=end_dt,
             local_target_dir=local_target_dir,
         )
+        result["channel_resolution"] = channel_resolution or {}
+        return result
     except Exception as exc:
         msg = str(exc)
         if "2147483650" not in msg and "0x80000002" not in msg:
@@ -1466,11 +1577,13 @@ def _download_dahua_clip_remote(
     start_dt: datetime,
     end_dt: datetime,
     local_target_dir: Path,
+    playback_sdk_channel: int | None = None,
+    channel_resolution: dict[str, Any] | None = None,
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
-    primary_channel = max(0, int(logical_channel) - 1)
+    primary_channel = max(0, int(playback_sdk_channel)) if playback_sdk_channel is not None else max(0, int(logical_channel) - 1)
     try:
-        return download_clip_via_bridge_dahua(
+        result = download_clip_via_bridge_dahua(
             bridge=bridge,
             host=host,
             sdk_port=int(sdk_port),
@@ -1482,6 +1595,8 @@ def _download_dahua_clip_remote(
             local_target_dir=local_target_dir,
             progress_callback=progress_callback,
         )
+        result["channel_resolution"] = channel_resolution or {}
+        return result
     except Exception as exc:
         msg = str(exc)
         if "2147483650" not in msg and "0x80000002" not in msg:
@@ -1517,8 +1632,20 @@ def _download_dahua_investigation_clip(
     start_dt: datetime,
     end_dt: datetime,
     local_target_dir: Path,
+    nvr_id: str | int | None = None,
+    nvr_name: str = "",
+    camera_id: str | int | None = None,
+    camera_name: str = "",
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
+    playback_sdk_channel, channel_resolution = _resolve_dahua_playback_sdk_channel(
+        host=host,
+        nvr_id=nvr_id,
+        nvr_name=nvr_name,
+        camera_id=camera_id,
+        camera_name=camera_name,
+        logical_channel=logical_channel,
+    )
     local_error: Exception | None = None
     if _should_use_local_dahua_sdk():
         try:
@@ -1528,6 +1655,8 @@ def _download_dahua_investigation_clip(
                 username=username,
                 password=password,
                 logical_channel=logical_channel,
+                playback_sdk_channel=playback_sdk_channel,
+                channel_resolution=channel_resolution,
                 start_dt=start_dt,
                 end_dt=end_dt,
                 local_target_dir=local_target_dir,
@@ -1552,6 +1681,8 @@ def _download_dahua_investigation_clip(
                 username=username,
                 password=password,
                 logical_channel=logical_channel,
+                playback_sdk_channel=playback_sdk_channel,
+                channel_resolution=channel_resolution,
                 start_dt=start_dt,
                 end_dt=end_dt,
                 local_target_dir=local_target_dir,
@@ -1583,6 +1714,10 @@ def _download_investigation_clip(
     start_dt: datetime,
     end_dt: datetime,
     local_target_dir: Path,
+    nvr_id: str | int | None = None,
+    nvr_name: str = "",
+    camera_id: str | int | None = None,
+    camera_name: str = "",
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     if vendor == "hikvision":
@@ -1650,6 +1785,10 @@ def _download_investigation_clip(
         start_dt=start_dt,
         end_dt=end_dt,
         local_target_dir=local_target_dir,
+        nvr_id=nvr_id,
+        nvr_name=nvr_name,
+        camera_id=camera_id,
+        camera_name=camera_name,
         progress_callback=progress_callback,
     )
 
@@ -2587,6 +2726,8 @@ class TrackPersonRequest(BaseModel):
     username: str = ""
     password: str | None = None
     logicalChannel: int
+    cameraId: str = ""
+    cameraName: str = ""
     startDt: str
     endDt: str
     similarityThreshold: float = 0.45
@@ -3331,6 +3472,8 @@ async def start_static_object_discovery(
     nvrId: str = Form(""),
     username: str = Form(""),
     password: str | None = Form(None),
+    cameraId: str = Form(""),
+    cameraName: str = Form(""),
     logicalChannel: int = Form(...),
     startDt: str = Form(...),
     endDt: str = Form(...),
@@ -3513,6 +3656,10 @@ async def start_static_object_discovery(
                             start_dt=probe_start,
                             end_dt=probe_end,
                             local_target_dir=check_downloads_dir,
+                            nvr_id=str(nvrId or "").strip(),
+                            nvr_name=resolved_nvr_name,
+                            camera_id=str(cameraId or "").strip(),
+                            camera_name=str(cameraName or "").strip(),
                             progress_callback=lambda s, d: _update_job(job_id, stage=s, detail=d),
                         )
                     clip_path = ensure_openable_clip(
@@ -3839,6 +3986,8 @@ async def start_static_object_discovery(
                         "nvrName": resolved_nvr_name,
                         "nvrId": str(nvrId or "").strip(),
                         "logicalChannel": int(logicalChannel),
+                        "cameraId": str(cameraId or "").strip(),
+                        "cameraName": str(cameraName or "").strip(),
                         "username": resolved_user,
                     },
                     "next_step": suggested_action["type"],
@@ -3881,6 +4030,8 @@ async def start_static_object_discovery(
                             "nvrName": resolved_nvr_name,
                             "nvrId": str(nvrId or "").strip(),
                             "logicalChannel": int(logicalChannel),
+                            "cameraId": str(cameraId or "").strip(),
+                            "cameraName": str(cameraName or "").strip(),
                             "username": resolved_user,
                         },
                     },
@@ -3972,6 +4123,8 @@ async def start_first_appearance(
     # y nosotros lo resolvemos desde `nvr_profiles.local.json`.
     username: str = Form(""),
     password: str | None = Form(None),
+    cameraId: str = Form(""),
+    cameraName: str = Form(""),
     logicalChannel: int = Form(...),
     startDt: str = Form(...),
     endDt: str = Form(...),
@@ -4152,6 +4305,10 @@ async def start_first_appearance(
                         start_dt=start_dt,
                         end_dt=end_dt,
                         local_target_dir=downloads_dir,
+                        nvr_id=str(nvrId or "").strip(),
+                        nvr_name=resolved_nvr_name,
+                        camera_id=str(cameraId or "").strip(),
+                        camera_name=str(cameraName or "").strip(),
                         progress_callback=lambda s, d: on_progress(s, d, 0.5),
                     )
 
@@ -4210,6 +4367,18 @@ async def start_first_appearance(
                     "coarse_report": coarse_report,
                     "refine_report": refine_report,
                     "refined_first": refined_first,
+                    "investigation_context": {
+                        "vendor": normalized_vendor,
+                        "host": resolved_host,
+                        "httpPort": resolved_http_port,
+                        "sdkPort": resolved_sdk_port,
+                        "nvrName": resolved_nvr_name,
+                        "nvrId": str(nvrId or "").strip(),
+                        "logicalChannel": int(logicalChannel),
+                        "cameraId": str(cameraId or "").strip(),
+                        "cameraName": str(cameraName or "").strip(),
+                        "username": resolved_user,
+                    },
                 }
                 if deferDeepSearch:
                     result_payload["next_step"] = "confirm_object"
@@ -4367,11 +4536,23 @@ def start_deep_search(
             with ENGINE_LOCK:
                 deep_dir = job_dir / "deep"
                 deep_dir.mkdir(parents=True, exist_ok=True)
+                live_preview_path = deep_dir / "analysis" / "live_preview.jpg"
+                live_preview_callback = _make_live_preview_callback(live_preview_path)
 
                 def on_progress(stage: str, detail: str, ratio: float) -> None:
                     base, span = 0.78, 0.20
                     progress = base + (span * max(0.0, min(1.0, float(ratio))))
                     _update_job(job_id, stage=stage, detail=detail, progress=progress)
+                    live_payload = dict(result_payload)
+                    live_payload["deepLive"] = {
+                        "stage": stage,
+                        "detail": detail,
+                        "progress": round(progress, 4),
+                        "previewPath": str(live_preview_path),
+                        "previewUrl": _artifact_url(job, live_preview_path.relative_to(job.job_dir)),
+                        "updatedAt": _now_iso(),
+                    }
+                    _update_job_partial(job_id, _rewrite_paths_to_urls(job, live_payload))
 
                 source_clip_path = clip_path if clip_path and clip_path.exists() else None
                 source_clip_start_offset = 0.0
@@ -4494,6 +4675,8 @@ def start_deep_search(
                         resolved_nvr_name = str(static_source_context.get("nvrName") or "").strip()
                         resolved_nvr_id = str(static_source_context.get("nvrId") or "").strip()
                         resolved_logical_channel = int(static_source_context.get("logicalChannel") or 1)
+                        resolved_camera_id = str(static_source_context.get("cameraId") or "").strip()
+                        resolved_camera_name = str(static_source_context.get("cameraName") or "").strip()
                         resolved_username, resolved_password = _resolve_nvr_credentials(
                             nvr_id=resolved_nvr_id,
                             nvr_name=resolved_nvr_name,
@@ -4523,6 +4706,10 @@ def start_deep_search(
                                 start_dt=window_start_dt,
                                 end_dt=window_end_dt,
                                 local_target_dir=downloads_dir,
+                                nvr_id=resolved_nvr_id,
+                                nvr_name=resolved_nvr_name,
+                                camera_id=resolved_camera_id,
+                                camera_name=resolved_camera_name,
                                 progress_callback=lambda stage, detail: _update_job(job_id, stage=stage, detail=detail),
                             )
                         source_clip_path = _prefer_native_clip_variant(Path(clip_result["final_local_path"]))
@@ -4633,6 +4820,7 @@ def start_deep_search(
                         save_annotated_video=DEEP_SAVE_ANNOTATED_VIDEO,
                         early_stop_on_person_match=True,
                         on_progress=on_progress,
+                        preview_callback=live_preview_callback,
                     )
                 deep_matches, first_match = _enrich_deep_matches(deep_report, deep_start=source_clip_start_offset)
                 if deep_matches:
@@ -4853,6 +5041,10 @@ def track_person_in_next_camera(
                             start_dt=start_dt,
                             end_dt=end_dt,
                             local_target_dir=downloads_dir,
+                            nvr_id=payload.nvrId,
+                            nvr_name=str(payload.nvrName or "").strip(),
+                            camera_id=str(payload.cameraId or "").strip(),
+                            camera_name=str(payload.cameraName or "").strip(),
                             progress_callback=lambda s, d: on_progress(s, d, 0.6),
                         )
 

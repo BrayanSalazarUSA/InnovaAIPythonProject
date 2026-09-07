@@ -1156,6 +1156,7 @@ def run_deep_analysis(
     save_annotated_video: bool = True,
     early_stop_on_person_match: bool = False,
     on_progress: ProgressCallback | None = None,
+    preview_callback: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     def on_status(update: dict[str, Any]) -> None:
         if on_progress is None:
@@ -1185,7 +1186,7 @@ def run_deep_analysis(
         preview_callback_sample_interval=preview_callback_sample_interval,
         early_stop_on_person_match=early_stop_on_person_match,
     )
-    return VideoProcessor(status_callback=on_status, preview_callback=None).run()
+    return VideoProcessor(status_callback=on_status, preview_callback=preview_callback).run()
 
 
 def file_to_base64(path: Path) -> str:
